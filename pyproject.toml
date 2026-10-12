@@ -1,0 +1,37 @@
+[project]
+name = "fabx-minter"
+version = "0.1.0"
+description = "Fab X (X Layer) 晶体管批量 mint 工具：SQLite 账号/任务存储 + Web 控制台"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "web3>=7.6,<8",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "jinja2>=3.1",
+    "httpx>=0.27",
+    "cryptography>=43",
+    "typer>=0.15",
+    "rich>=13.9",
+]
+
+[project.scripts]
+fabx = "fabx_minter.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fabx_minter"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

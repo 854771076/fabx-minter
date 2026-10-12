@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Fab X 批量 Mint 控制台{% endblock %}</title>
+  <script src="https://unpkg.com/lucide@0.454.0/dist/umd/lucide.min.js"></script>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --panel: #151b23;
+      --panel-2: #1b222c;
+      --border: #2a323d;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --accent: #3fb950;
+      --accent-2: #58a6ff;
+      --warn: #d29922;
+      --danger: #f85149;
+      --radius: 6px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 13px/1.5 -apple-system, "SF Pro Text", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    a { color: var(--accent-2); }
+    header.topbar {
+      display: flex; align-items: center; gap: 16px;
+      padding: 10px 18px; border-bottom: 1px solid var(--border);
+      background: var(--panel); position: sticky; top: 0; z-index: 20;
+    }
+    header.topbar h1 { font-size: 15px; margin: 0; font-weight: 600; }
+    .brand-mark {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 26px; height: 26px; border-radius: var(--radius);
+      background: var(--accent); color: #06210f;
+    }
+    .pill {
+      display: inline-flex; align-items: center; gap: 5px;
+      padding: 2px 8px; border-radius: 999px; font-size: 12px;
+      border: 1px solid var(--border); color: var(--muted); background: var(--panel-2);
+      white-space: nowrap;
+    }
+    .pill.ok { color: var(--accent); border-color: rgba(63,185,80,.4); }
+    .pill.bad { color: var(--danger); border-color: rgba(248,81,73,.4); }
+    main { padding: 16px 18px 60px; max-width: 1280px; margin: 0 auto; }
+    nav.tabs { display: flex; gap: 4px; padding: 0 18px; background: var(--panel); border-bottom: 1px solid var(--border); position: sticky; top: 47px; z-index: 15; overflow-x: auto; }
+    nav.tabs button {
+      appearance: none; border: 0; background: transparent; color: var(--muted);
+      padding: 10px 12px; font-size: 13px; cursor: pointer; display: inline-flex; gap: 6px;
+      align-items: center; border-bottom: 2px solid transparent; white-space: nowrap;
+    }
+    nav.tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
+    section.panel {
+      border: 1px solid var(--border); border-radius: var(--radius);
+      background: var(--panel); margin-bottom: 16px; overflow: hidden;
+    }
+    section.panel > header {
+      display: flex; align-items: center; gap: 10px; justify-content: space-between;
+      padding: 10px 14px; border-bottom: 1px solid var(--border); background: var(--panel-2);
+    }
+    section.panel > header h2 { font-size: 13px; margin: 0; font-weight: 600; display: inline-flex; gap: 7px; align-items: center; }
+    .panel-body { padding: 14px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
+    .field { display: flex; flex-direction: column; gap: 5px; min-width: 150px; flex: 1 1 150px; }
+    .field > label { font-size: 12px; color: var(--muted); }
+    input, select, textarea {
+      background: var(--bg); color: var(--text); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 7px 9px; font: inherit; width: 100%;
+    }
+    input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent-2); }
+    textarea { min-height: 96px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    button.btn {
+      display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+      background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 7px 12px; font: inherit;
+    }
+    button.btn:hover { border-color: var(--muted); }
+    button.btn.primary { background: var(--accent); border-color: var(--accent); color: #06210f; font-weight: 600; }
+    button.btn.primary:hover { filter: brightness(1.08); }
+    button.btn.danger { color: var(--danger); }
+    button.btn:disabled { opacity: .5; cursor: not-allowed; }
+    button.icon { padding: 5px 7px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+    th { color: var(--muted); font-weight: 500; background: var(--panel-2); position: sticky; top: 0; }
+    tbody tr:hover { background: rgba(255,255,255,.02); }
+    code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    .muted { color: var(--muted); }
+    .tag { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; border: 1px solid var(--border); }
+    .tag.confirmed { color: var(--accent); border-color: rgba(63,185,80,.4); }
+    .tag.sent { color: var(--accent-2); border-color: rgba(88,166,255,.4); }
+    .tag.pending { color: var(--muted); }
+    .tag.failed { color: var(--danger); border-color: rgba(248,81,73,.4); }
+    .tag.skipped { color: var(--warn); border-color: rgba(210,153,34,.4); }
+    .tag.running { color: var(--accent-2); border-color: rgba(88,166,255,.4); }
+    .tag.done { color: var(--accent); border-color: rgba(63,185,80,.4); }
+    .tag.draft, .tag.paused { color: var(--muted); }
+    .toasts { position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 60; max-width: 380px; }
+    .toast { border: 1px solid var(--border); border-left: 3px solid var(--accent-2); background: var(--panel); border-radius: var(--radius); padding: 9px 12px; }
+    .toast.error { border-left-color: var(--danger); }
+    .toast.warn { border-left-color: var(--warn); }
+    .toast.ok { border-left-color: var(--accent); }
+    .split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr); gap: 16px; }
+    @media (max-width: 900px) { .split { grid-template-columns: minmax(0, 1fr); } }
+    .checkbox { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+    .checkbox input { width: auto; }
+    .scroll { max-height: 420px; overflow: auto; }
+    .empty { padding: 22px; text-align: center; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <span class="brand-mark"><i data-lucide="cpu" style="width:16px;height:16px"></i></span>
+    <h1>Fab X 批量 Mint 控制台</h1>
+    <span class="pill"><i data-lucide="link" style="width:13px;height:13px"></i> X Layer · chainId {{ chain_id }}</span>
+    <span class="pill" id="health-pill"><i data-lucide="activity" style="width:13px;height:13px"></i> 检测中…</span>
+    <span style="flex:1"></span>
+    <span class="pill mono" title="RPC 节点">{{ rpc_url }}</span>
+  </header>
+
+  <nav class="tabs" role="tablist" id="tabs">
+    <button role="tab" data-tab="accounts" aria-selected="true"><i data-lucide="users" style="width:14px;height:14px"></i> 账号</button>
+    <button role="tab" data-tab="cpus" aria-selected="false"><i data-lucide="cpu" style="width:14px;height:14px"></i> CPU / 合约</button>
+    <button role="tab" data-tab="jobs" aria-selected="false"><i data-lucide="list-checks" style="width:14px;height:14px"></i> 任务</button>
+    <button role="tab" data-tab="fund" aria-selected="false"><i data-lucide="wallet" style="width:14px;height:14px"></i> 资金分发</button>
+  </nav>
+
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+
+  <div class="toasts" id="toasts"></div>
+  <script>
+    window.FABX = {
+      chainId: {{ chain_id }},
+      apiUrl: {{ api_url | tojson }},
+    };
+  </script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

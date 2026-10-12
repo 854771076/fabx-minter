@@ -1,0 +1,610 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section class="panel">
+  <div class="panel-body row">
+    <div class="field" style="flex:3 1 360px">
+      <label>操作口令（用于加密/解密私钥；仅缓存在本机浏览器，不会写入日志）</label>
+      <input type="password" id="global-password" autocomplete="off" placeholder="留空则使用服务端 FABX_SECRET 环境变量">
+    </div>
+    <button class="btn" id="save-password"><i data-lucide="key-round" style="width:15px;height:15px"></i> 记住口令</button>
+    <div class="field" style="flex:2 1 240px">
+      <label>Web 访问令牌（服务端配置 FABX_WEB_TOKEN 时必填；仅缓存本机浏览器）</label>
+      <input type="password" id="access-token" autocomplete="off" placeholder="未启用鉴权时留空">
+    </div>
+    <button class="btn" id="save-token"><i data-lucide="shield-check" style="width:15px;height:15px"></i> 记住令牌</button>
+    <button class="btn" id="refresh-all"><i data-lucide="refresh-cw" style="width:15px;height:15px"></i> 刷新全部</button>
+  </div>
+</section>
+
+<!-- 账号 -->
+<div data-section="accounts">
+  <div class="split">
+    <section class="panel">
+      <header><h2><i data-lucide="file-plus-2" style="width:15px;height:15px"></i> 批量导入账号</h2></header>
+      <div class="panel-body">
+        <div class="field">
+          <label>私钥列表（每行一个，支持 <code>私钥,备注</code>；可带 0x 前缀）</label>
+          <textarea id="import-content" placeholder="0xabc...&#10;0xdef...,钱包B&#10;# 以 # 开头的行会被忽略"></textarea>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <div class="field">
+            <label>统一分组</label>
+            <input id="import-group" placeholder="例如 batch-01">
+          </div>
+          <div class="field">
+            <label>备注前缀（无单独备注时使用）</label>
+            <input id="import-label" placeholder="例如 acc">
+          </div>
+          <button class="btn primary" id="do-import"><i data-lucide="upload" style="width:15px;height:15px"></i> 导入并加密入库</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <header>
+        <h2><i data-lucide="wallet-cards" style="width:15px;height:15px"></i> 账号列表</h2>
+        <span class="muted" id="accounts-summary">—</span>
+      </header>
+      <div class="scroll">
+        <table>
+          <thead>
+            <tr><th>ID</th><th>地址</th><th>备注</th><th>分组</th><th>OKB</th><th>启用</th><th></th></tr>
+          </thead>
+          <tbody id="accounts-body">
+            <tr><td colspan="7" class="empty">加载中…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+</div>
+
+<!-- CPU -->
+<div data-section="cpus" hidden>
+  <section class="panel">
+    <header>
+      <h2><i data-lucide="cpu" style="width:15px;height:15px"></i> CPU / 晶体管合约</h2>
+      <div class="row" style="gap:8px">
+        <label class="checkbox"><input type="checkbox" id="cpus-group"> 按规格合并</label>
+        <button class="btn" id="sync-cpus"><i data-lucide="cloud-download" style="width:15px;height:15px"></i> 同步官方 CPU 列表</button>
+      </div>
+    </header>
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr><th>名称</th><th>电路 ERC721</th><th>晶体管 ERC1155</th><th>单价</th><th>已铸/上限</th><th>电路数</th><th></th></tr>
+        </thead>
+        <tbody id="cpus-body">
+          <tr><td colspan="7" class="empty">尚未同步，点击右上角「同步官方 CPU 列表」</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+</div>
+
+<!-- 任务 -->
+<div data-section="jobs" hidden>
+  <section class="panel">
+    <header><h2><i data-lucide="target" style="width:15px;height:15px"></i> 创建铸造任务</h2></header>
+    <div class="panel-body">
+      <div class="row">
+        <div class="field" style="flex:2 1 320px">
+          <label>晶体管合约地址（mint 目标）</label>
+          <input id="job-transistors" placeholder="0x...">
+        </div>
+        <div class="field">
+          <label>Token ID</label>
+          <input id="job-token" type="number" min="0" step="1" value="0">
+        </div>
+        <div class="field">
+          <label>每账号数量</label>
+          <input id="job-amount" type="number" min="1" step="1" value="1">
+        </div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <div class="field">
+          <label>任务名称</label>
+          <input id="job-name" placeholder="例如 FAB_No1 NAND x1">
+        </div>
+        <div class="field">
+          <label>账号分组（留空=全部启用账号）</label>
+          <input id="job-group" placeholder="batch-01">
+        </div>
+        <div class="field">
+          <label>指定账号 ID（逗号分隔，优先生效）</label>
+          <input id="job-accounts" placeholder="1,2,3">
+        </div>
+      </div>
+      <div class="row" style="margin-top:12px; align-items:center">
+        <label class="checkbox"><input type="checkbox" id="job-dry"> 仅演练（dry-run，不广播）</label>
+        <label class="checkbox"><input type="checkbox" id="job-stop"> 首个失败即停止该账号</label>
+        <span style="flex:1"></span>
+        <button class="btn" id="plan-job"><i data-lucide="calculator" style="width:15px;height:15px"></i> 预览花费</button>
+        <button class="btn primary" id="create-job"><i data-lucide="plus" style="width:15px;height:15px"></i> 创建任务</button>
+      </div>
+      <p class="muted" id="plan-hint" style="margin:10px 0 0"></p>
+    </div>
+  </section>
+
+  <div class="split">
+    <section class="panel">
+      <header><h2><i data-lucide="list-checks" style="width:15px;height:15px"></i> 任务列表</h2>
+        <button class="btn icon" id="reload-jobs" title="刷新"><i data-lucide="refresh-cw" style="width:15px;height:15px"></i></button>
+      </header>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>ID</th><th>名称</th><th>状态</th><th>进度</th><th></th></tr></thead>
+          <tbody id="jobs-body"><tr><td colspan="5" class="empty">暂无任务</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <header>
+        <h2><i data-lucide="scroll-text" style="width:15px;height:15px"></i> 任务详情 <span class="muted" id="job-detail-title"></span></h2>
+        <div class="row" style="gap:8px">
+          <button class="btn" id="reset-job"><i data-lucide="rotate-ccw" style="width:15px;height:15px"></i> 重置失败/跳过</button>
+          <button class="btn primary" id="run-job"><i data-lucide="play" style="width:15px;height:15px"></i> 执行任务</button>
+        </div>
+      </header>
+      <div class="scroll" id="job-detail">
+        <p class="empty">选择左侧任务查看明细</p>
+      </div>
+    </section>
+  </div>
+</div>
+
+<!-- 资金 -->
+<div data-section="fund" hidden>
+  <section class="panel">
+    <header><h2><i data-lucide="banknote" style="width:15px;height:15px"></i> 从主钱包分发 OKB</h2></header>
+    <div class="panel-body">
+      <div class="row">
+        <div class="field" style="flex:3 1 360px">
+          <label>主钱包私钥（仅用于本次签名，不落库）</label>
+          <input id="fund-key" type="password" autocomplete="off" placeholder="0x...">
+        </div>
+        <div class="field">
+          <label>每个账号目标余额（OKB）</label>
+          <input id="fund-amount" placeholder="0.01">
+        </div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <div class="field">
+          <label>账号分组（留空=全部启用账号）</label>
+          <input id="fund-group" placeholder="batch-01">
+        </div>
+        <div class="field">
+          <label>指定账号 ID（逗号分隔）</label>
+          <input id="fund-accounts" placeholder="1,2,3">
+        </div>
+      </div>
+      <div class="row" style="margin-top:12px; align-items:center">
+        <label class="checkbox"><input type="checkbox" id="fund-topup" checked> 补足到目标余额</label>
+        <label class="checkbox"><input type="checkbox" id="fund-dry"> 仅演练</label>
+        <span style="flex:1"></span>
+        <button class="btn primary" id="do-fund"><i data-lucide="send" style="width:15px;height:15px"></i> 开始分发</button>
+      </div>
+      <div id="fund-result" style="margin-top:12px"></div>
+    </div>
+  </section>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+
+const PW_KEY = "fabx.password";
+const TOKEN_KEY = "fabx.accessToken";
+let currentJobId = null;
+
+function icons() { if (window.lucide) window.lucide.createIcons(); }
+
+function toast(message, kind = "ok") {
+  const el = document.createElement("div");
+  el.className = `toast ${kind}`;
+  el.textContent = message;
+  $("#toasts").appendChild(el);
+  setTimeout(() => el.remove(), 6000);
+}
+
+function getPassword() { return $("#global-password").value.trim() || null; }
+
+function getToken() { return $("#access-token").value.trim() || null; }
+
+function short(addr) {
+  return addr ? `${addr.slice(0, 8)}…${addr.slice(-6)}` : "—";
+}
+
+function okbToWei(text) {
+  const value = String(text ?? "").trim();
+  if (!/^\d+(\.\d+)?$|^\.\d+$/.test(value)) throw new Error(`金额格式不正确: ${value}`);
+  const [whole, frac = ""] = value.split(".");
+  const fracPadded = (frac + "0".repeat(18)).slice(0, 18);
+  return (BigInt(whole || "0") * 10n ** 18n + BigInt(fracPadded || "0")).toString();
+}
+
+function weiToOkb(wei) {
+  if (wei === null || wei === undefined) return "—";
+  const s = BigInt(wei).toString().padStart(19, "0");
+  const whole = s.slice(0, -18);
+  const frac = s.slice(-18).replace(/0+$/, "");
+  return frac ? `${whole}.${frac}` : whole;
+}
+
+async function api(path, options = {}) {
+  const opts = { ...options };
+  opts.headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+  // 服务端启用 FABX_WEB_TOKEN 后，所有业务接口都要带这个自定义头；
+  // 自定义头会触发跨域预检，等于顺带挡掉了网页发起的跨站请求。
+  const token = getToken();
+  if (token) opts.headers["X-FABX-Token"] = token;
+  if (opts.body && typeof opts.body !== "string") opts.body = JSON.stringify(opts.body);
+  const resp = await fetch(path, opts);
+  const text = await resp.text();
+  let data = null;
+  if (text) { try { data = JSON.parse(text); } catch { data = text; } }
+  if (!resp.ok) {
+    const detail = (data && data.detail) ? (typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail)) : `HTTP ${resp.status}`;
+    throw new Error(detail);
+  }
+  return data;
+}
+
+function parseIds(text) {
+  const value = String(text || "").trim();
+  if (!value) return null;
+  return value.split(/[,\s]+/).filter(Boolean).map((x) => {
+    const n = Number(x);
+    if (!Number.isInteger(n) || n <= 0) throw new Error(`账号 ID 非法: ${x}`);
+    return n;
+  });
+}
+
+// ---------------------------------------------------------------- 健康检查
+async function refreshHealth() {
+  const pill = $("#health-pill");
+  try {
+    const data = await api("/api/health");
+    const ok = data.status === "ok";
+    pill.className = `pill ${ok ? "ok" : "bad"}`;
+    pill.innerHTML = `<i data-lucide="${ok ? "activity" : "triangle-alert"}" style="width:13px;height:13px"></i>`;
+    pill.append(ok ? "链上连接正常" : `RPC 异常：${data.rpc_error || "未知"}`);
+  } catch (err) {
+    pill.className = "pill bad";
+    pill.textContent = `服务不可用：${err.message}`;
+  }
+  icons();
+}
+
+// -------------------------------------------------------------------- 账号
+async function refreshAccounts() {
+  const body = $("#accounts-body");
+  try {
+    const rows = await api("/api/accounts");
+    $("#accounts-summary").textContent = `共 ${rows.length} 个账号`;
+    if (!rows.length) {
+      body.innerHTML = '<tr><td colspan="7" class="empty">还没有账号，先在左侧导入私钥</td></tr>';
+      return;
+    }
+    body.innerHTML = rows.map((a) => `
+      <tr data-id="${a.id}">
+        <td>${a.id}</td>
+        <td class="mono" title="${a.address}">${short(a.address)}</td>
+        <td>${a.label ? escapeHtml(a.label) : '<span class="muted">—</span>'}</td>
+        <td>${a.group ? escapeHtml(a.group) : '<span class="muted">—</span>'}</td>
+        <td class="mono">${a.balance_wei === null || a.balance_wei === undefined ? '<span class="muted">RPC 不可用</span>' : weiToOkb(a.balance_wei)}</td>
+        <td><input type="checkbox" data-toggle="${a.id}" ${a.enabled ? "checked" : ""}></td>
+        <td><button class="btn icon danger" data-del="${a.id}" title="删除账号"><i data-lucide="trash-2" style="width:14px;height:14px"></i></button></td>
+      </tr>`).join("");
+    icons();
+  } catch (err) {
+    body.innerHTML = `<tr><td colspan="7" class="empty">加载失败：${escapeHtml(err.message)}</td></tr>`;
+  }
+}
+
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+}
+
+// --------------------------------------------------------------------- CPU
+let cpuCache = [];
+
+async function refreshCpus() {
+  const body = $("#cpus-body");
+  try {
+    cpuCache = await api("/api/cpus");
+    if (!cpuCache.length) {
+      body.innerHTML = '<tr><td colspan="7" class="empty">尚未同步，点击右上角「同步官方 CPU 列表」</td></tr>';
+      return;
+    }
+    body.innerHTML = cpuCache.map((c) => `
+      <tr>
+        <td>${c.name ? escapeHtml(c.name) : '<span class="muted">未命名</span>'}</td>
+        <td class="mono" title="${c.circuits}">${short(c.circuits)}</td>
+        <td class="mono" title="${c.transistors}">${short(c.transistors)}</td>
+        <td class="mono">${c.mint_price_wei === null ? "—" : weiToOkb(c.mint_price_wei)} OKB</td>
+        <td class="mono">${c.minted ?? "—"} / ${c.supply_cap ?? "—"}</td>
+        <td class="mono">${c.circuit_count ?? "—"}</td>
+        <td><button class="btn icon" data-pick="${c.transistors}" title="用作铸造目标"><i data-lucide="crosshair" style="width:14px;height:14px"></i></button></td>
+      </tr>`).join("");
+    icons();
+  } catch (err) {
+    body.innerHTML = `<tr><td colspan="7" class="empty">加载失败：${escapeHtml(err.message)}</td></tr>`;
+  }
+}
+
+// -------------------------------------------------------------------- 任务
+function jobPayload() {
+  const transistors = $("#job-transistors").value.trim();
+  if (!/^0x[0-9a-fA-F]{40}$/.test(transistors)) throw new Error("晶体管合约地址格式不正确");
+  const tokenId = Number($("#job-token").value);
+  const amount = Number($("#job-amount").value);
+  if (!Number.isInteger(tokenId) || tokenId < 0) throw new Error("Token ID 必须是非负整数");
+  if (!Number.isInteger(amount) || amount <= 0) throw new Error("数量必须为正整数");
+  return {
+    name: $("#job-name").value.trim() || `mint ${short(transistors)} id=${tokenId} x${amount}`,
+    targets: [{ transistors, token_id: tokenId, amount }],
+    account_ids: parseIds($("#job-accounts").value),
+    group: $("#job-group").value.trim() || null,
+    stop_on_first_failure: $("#job-stop").checked,
+    dry_run: $("#job-dry").checked,
+  };
+}
+
+let pollTimer = null;
+
+async function refreshJobs() {
+  const body = $("#jobs-body");
+  try {
+    const jobs = await api("/api/jobs");
+    if (!jobs.length) {
+      body.innerHTML = '<tr><td colspan="5" class="empty">暂无任务</td></tr>';
+      return;
+    }
+    body.innerHTML = jobs.map((j) => {
+      // 进度与后端口径一致：confirmed/failed/skipped 都算已收尾，避免全跳过的任务显示成 0/1
+      const finished = j.confirmed + j.failed + j.skipped;
+      const tags = `${j.failed ? ` <span class="tag failed">失败 ${j.failed}</span>` : ""}${j.skipped ? ` <span class="tag skipped">跳过 ${j.skipped}</span>` : ""}`;
+      return `
+      <tr data-job="${j.id}" style="cursor:pointer">
+        <td>${j.id}</td>
+        <td>${escapeHtml(j.name)}${j.dry_run ? ' <span class="tag skipped">dry</span>' : ""}</td>
+        <td><span class="tag ${j.status}">${j.status}</span></td>
+        <td class="mono">${finished}/${j.total}${tags}</td>
+        <td><button class="btn icon" data-run="${j.id}" title="执行"><i data-lucide="play" style="width:14px;height:14px"></i></button></td>
+      </tr>`;
+    }).join("");
+    icons();
+  } catch (err) {
+    body.innerHTML = `<tr><td colspan="5" class="empty">加载失败：${escapeHtml(err.message)}</td></tr>`;
+  }
+}
+
+async function showJob(jobId) {
+  currentJobId = jobId;
+  const detail = $("#job-detail");
+  try {
+    const data = await api(`/api/jobs/${jobId}`);
+    const j = data.job;
+    $("#job-detail-title").textContent = `#${j.id} · ${j.name} · ${j.status}${data.running ? "（运行中）" : ""}`;
+    const rows = data.tasks.map((t) => `
+      <tr>
+        <td>${t.id}</td>
+        <td class="mono" title="${t.address || ""}">${short(t.address)}</td>
+        <td class="mono">id=${t.token_id} ×${t.amount}</td>
+        <td class="mono">${weiToOkb(t.value_wei)}</td>
+        <td><span class="tag ${t.status}">${t.status}</span></td>
+        <td class="mono">${t.tx_hash ? `<a href="https://www.oklink.com/xlayer/tx/${t.tx_hash}" target="_blank" rel="noreferrer">${t.tx_hash.slice(0, 10)}…</a>` : '<span class="muted">—</span>'}</td>
+        <td class="muted">${t.error ? escapeHtml(t.error.slice(0, 80)) : ""}</td>
+      </tr>`).join("");
+    detail.innerHTML = `
+      <table><thead><tr><th>#</th><th>账号</th><th>目标</th><th>花费</th><th>状态</th><th>交易</th><th>错误</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="7" class="empty">该任务没有子任务</td></tr>'}</tbody></table>
+      ${data.events.length ? `<div class="panel-body"><h3 style="font-size:12px;color:var(--muted)">事件</h3>${data.events.map((e) => `<div class="mono muted">[${e.level}] ${escapeHtml(e.message)}</div>`).join("")}</div>` : ""}`;
+    if (data.running || (j.status === "running")) scheduleJobPoll(jobId);
+  } catch (err) {
+    detail.innerHTML = `<p class="empty">加载失败：${escapeHtml(err.message)}</p>`;
+  }
+}
+
+function scheduleJobPoll(jobId) {
+  if (pollTimer) clearTimeout(pollTimer);
+  pollTimer = setTimeout(async () => {
+    await refreshJobs();
+    await showJob(jobId);
+  }, 2500);
+}
+
+// -------------------------------------------------------------------- 资金
+async function doFund() {
+  const key = $("#fund-key").value.trim();
+  if (!/^(0x)?[0-9a-fA-F]{64}$/.test(key)) { toast("主钱包私钥格式不正确", "error"); return; }
+  let amountWei;
+  try { amountWei = okbToWei($("#fund-amount").value); }
+  catch (err) { toast(err.message, "error"); return; }
+  if (amountWei === "0") { toast("金额必须大于 0", "error"); return; }
+
+  const btn = $("#do-fund");
+  btn.disabled = true;
+  try {
+    const result = await api("/api/fund", {
+      method: "POST",
+      body: {
+        master_private_key: key,
+        amount_wei: amountWei,
+        account_ids: parseIds($("#fund-accounts").value),
+        top_up: $("#fund-topup").checked,
+        dry_run: $("#fund-dry").checked,
+      },
+    });
+    $("#fund-result").innerHTML = `
+      <p class="mono">主钱包 ${short(result.master_address)} · 成功 ${result.sent} · 跳过 ${result.skipped} · 失败 ${result.failed} · 待确认 ${result.pending} · 合计 ${weiToOkb(result.total_wei)} OKB</p>
+      <table><thead><tr><th>账号</th><th>金额</th><th>状态</th><th>交易</th></tr></thead>
+      <tbody>${result.items.map((i) => `<tr><td class="mono">${short(i.address)}</td><td class="mono">${weiToOkb(i.amount_wei)}</td><td><span class="tag ${i.status}">${i.status}</span></td><td class="mono">${i.tx_hash ? i.tx_hash.slice(0, 12) + "…" : (i.error ? escapeHtml(i.error) : "—")}</td></tr>`).join("")}</tbody></table>`;
+    toast(`资金分发完成：成功 ${result.sent}，失败 ${result.failed}`, result.failed ? "warn" : "ok");
+    await refreshAccounts();
+  } catch (err) {
+    toast(err.message, "error");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// -------------------------------------------------------------------- 交互
+function bindTabs() {
+  $$("#tabs button").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      $$("#tabs button").forEach((b) => b.setAttribute("aria-selected", String(b === btn)));
+      const target = btn.dataset.tab;
+      $$("[data-section]").forEach((s) => { s.hidden = s.dataset.section !== target; });
+      if (target === "accounts") refreshAccounts();
+      if (target === "cpus") refreshCpus();
+      if (target === "jobs") refreshJobs();
+    });
+  });
+}
+
+function bind() {
+  const saved = localStorage.getItem(PW_KEY);
+  if (saved) $("#global-password").value = saved;
+
+  $("#save-password").addEventListener("click", () => {
+    localStorage.setItem(PW_KEY, $("#global-password").value);
+    toast("口令已保存在本机浏览器", "ok");
+  });
+
+  const savedToken = localStorage.getItem(TOKEN_KEY);
+  if (savedToken) $("#access-token").value = savedToken;
+  $("#save-token").addEventListener("click", () => {
+    localStorage.setItem(TOKEN_KEY, $("#access-token").value.trim());
+    toast("访问令牌已保存在本机浏览器", "ok");
+  });
+  // 令牌变化后立即重试一次，省去手动刷新
+  $("#access-token").addEventListener("change", () => refreshHealth());
+
+  $("#refresh-all").addEventListener("click", async () => {
+    await Promise.all([refreshHealth(), refreshAccounts(), refreshCpus(), refreshJobs()]);
+    toast("已刷新", "ok");
+  });
+
+  $("#do-import").addEventListener("click", async () => {
+    const content = $("#import-content").value.trim();
+    if (!content) { toast("请先粘贴私钥", "error"); return; }
+    try {
+      // 口令随请求体发送而不是塞进 URL：查询串会被服务器日志记录
+      const result = await api("/api/accounts/import", {
+        method: "POST",
+        body: {
+          content,
+          label_prefix: $("#import-label").value.trim() || null,
+          group: $("#import-group").value.trim() || null,
+          password: getPassword(),
+        },
+      });
+      toast(`导入成功 ${result.imported.length} 个` + (result.errors.length ? `，失败 ${result.errors.length} 个` : ""), result.errors.length ? "warn" : "ok");
+      if (result.errors.length) result.errors.forEach((e) => toast(e, "error"));
+      $("#import-content").value = "";
+      await refreshAccounts();
+    } catch (err) { toast(err.message, "error"); }
+  });
+
+  $("#accounts-body").addEventListener("click", async (ev) => {
+    const del = ev.target.closest("[data-del]");
+    if (del) {
+      const id = del.dataset.del;
+      if (!confirm(`确认删除账号 #${id}？该操作不可撤销。`)) return;
+      try { await api(`/api/accounts/${id}`, { method: "DELETE" }); toast("账号已删除", "ok"); await refreshAccounts(); }
+      catch (err) { toast(err.message, "error"); }
+    }
+  });
+  $("#accounts-body").addEventListener("change", async (ev) => {
+    const toggle = ev.target.closest("[data-toggle]");
+    if (!toggle) return;
+    try {
+      await api(`/api/accounts/${toggle.dataset.toggle}`, { method: "PATCH", body: { enabled: toggle.checked } });
+      toast(toggle.checked ? "已启用" : "已停用", "ok");
+    } catch (err) { toast(err.message, "error"); }
+  });
+
+  $("#sync-cpus").addEventListener("click", async () => {
+    const btn = $("#sync-cpus");
+    btn.disabled = true;
+    try { const rows = await api("/api/cpus/sync", { method: "POST" }); toast(`已同步 ${rows.length} 个 CPU`, "ok"); await refreshCpus(); }
+    catch (err) { toast(err.message, "error"); }
+    finally { btn.disabled = false; }
+  });
+
+  $("#cpus-body").addEventListener("click", async (ev) => {
+    const pick = ev.target.closest("[data-pick]");
+    if (!pick) return;
+    $("#job-transistors").value = pick.dataset.pick;
+    try {
+      const state = await api(`/api/transistors/${pick.dataset.pick}`);
+      $("#job-token").value = state.nand_id;
+      $("#job-name").value = `${state.cpu_name || short(state.address)} NAND ×1`;
+      toast(`单价 ${state.mint_price_okb} OKB · NAND id=${state.nand_id} · LATCH id=${state.latch_id}`, "ok");
+    } catch (err) { toast(err.message, "error"); }
+    $$("#tabs button").find((b) => b.dataset.tab === "jobs").click();
+  });
+
+  $("#plan-job").addEventListener("click", async () => {
+    try {
+      const plan = await api("/api/plan", { method: "POST", body: jobPayload() });
+      $("#plan-hint").textContent = `共 ${plan.count} 笔，预计花费 ${weiToOkb(plan.total_value_wei)} OKB${plan.notes.length ? " · " + plan.notes.join("；") : ""}`;
+      toast("预览完成", "ok");
+    } catch (err) { toast(err.message, "error"); }
+  });
+
+  $("#create-job").addEventListener("click", async () => {
+    try {
+      const job = await api("/api/jobs", { method: "POST", body: jobPayload() });
+      toast(`任务 #${job.id} 已创建，共 ${job.total} 笔`, "ok");
+      await refreshJobs();
+      await showJob(job.id);
+    } catch (err) { toast(err.message, "error"); }
+  });
+
+  $("#reload-jobs").addEventListener("click", () => refreshJobs());
+  $("#jobs-body").addEventListener("click", async (ev) => {
+    const runBtn = ev.target.closest("[data-run]");
+    if (runBtn) { ev.stopPropagation(); await runJob(Number(runBtn.dataset.run)); return; }
+    const row = ev.target.closest("[data-job]");
+    if (row) await showJob(Number(row.dataset.job));
+  });
+
+  $("#run-job").addEventListener("click", async () => {
+    if (currentJobId === null) { toast("请先选择任务", "error"); return; }
+    await runJob(currentJobId);
+  });
+
+  $("#reset-job").addEventListener("click", async () => {
+    if (currentJobId === null) { toast("请先选择任务", "error"); return; }
+    try { await api(`/api/jobs/${currentJobId}/reset`, { method: "POST" }); toast("已重置失败/跳过任务", "ok"); await showJob(currentJobId); }
+    catch (err) { toast(err.message, "error"); }
+  });
+
+  $("#do-fund").addEventListener("click", doFund);
+}
+
+async function runJob(jobId) {
+  try {
+    await api(`/api/jobs/${jobId}/run`, { method: "POST", body: { password: getPassword() } });
+    toast(`任务 #${jobId} 已开始执行`, "ok");
+    await refreshJobs();
+    await showJob(jobId);
+  } catch (err) { toast(err.message, "error"); }
+}
+
+document.addEventListener("DOMContentLoaded", async () => {
+  bindTabs();
+  bind();
+  icons();
+  await Promise.all([refreshHealth(), refreshAccounts(), refreshCpus(), refreshJobs()]);
+});
+</script>
+{% endblock %}
