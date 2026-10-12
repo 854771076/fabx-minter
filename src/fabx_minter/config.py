@@ -39,12 +39,14 @@ class Settings(BaseSettings):
     chain_id: int = 196
     api_url: str = "https://api.fabx.tech"
 
-    # 合约地址（fabx.tech 前端产物 config-DJaFdDfO.js）
-    circuit_factory_address: str = "0x138fA3B38b1461B5908C455ABD30fC55029b7e71"
-    marketplace_address: str = "0xF48DD28A992f891D781dFBEe59Ab03dDAfD5a02C"
-    circuit_market_address: str = "0x1ca1C665a7630560E237c010F879b59086D715BB"
-    pod_mining_address: str = "0x37E1518Dd3c5A173Ca4773F3b252440c10FAe9D1"
-    xmake_address: str = "0x551630E595789b7e91948368c1b751404b5d75ab"
+    # 合约地址取自 fabx.tech 前端产物 config-BhXPazbF.js（2026-10 v2 部署）。
+    # 站点会「整站重新部署」并更换全套地址：旧工厂 0x138fA3B3… 的两个 CPU 已售罄，
+    # 新工厂下才有额度。地址变了就覆盖 FABX_CIRCUIT_FACTORY_ADDRESS 或直接改这里的默认值。
+    circuit_factory_address: str = "0x82935793a854fA2F2e8A9d2B3F17BbfBf81D6C05"
+    marketplace_address: str = "0x7F955C233FDb17e98FB26F330D778D3E30fe6Ee6"
+    circuit_market_address: str = "0x0BC37F95aE57bb20e995D425d46D6df9f22Bd7a1"
+    pod_mining_address: str = "0xB6d4d03e9DfD3aD4889241e23F12EA4557696018"
+    xmake_address: str = "0xC8c0D268563F59D6cA3A42C48450A6A8Af399843"
     multicall3_address: str = "0xcA11bde05977b3631167028862bE2a173976CA11"
 
     # 存储

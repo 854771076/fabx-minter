@@ -248,13 +248,16 @@ value = protocolFee + mintPrice × amount
 - **`mintPrice`**：单价，由 `mintPrice()` 给出；
 - **gas**：单独消耗，不包含在 value 里。当前网络 gasPrice 很低，单笔 `mint` 约 89k gas。
 
-举例（`FAB_No1`，`mintPrice = 0.0001 OKB`、`protocolFee = 0.00065 OKB`）：
+举例（v2 当前 `RefBench`，`mintPrice = 1 wei`、`protocolFee = 0.00065 OKB`）：
 
 | 每账号数量 | value = 协议费 + 单价×数量 | 折合 |
 | --- | --- | --- |
-| 1 | 0.00065 + 0.0001 | ≈ 0.00075 OKB |
-| 10 | 0.00065 + 0.001 | ≈ 0.00165 OKB |
-| 100 | 0.00065 + 0.01 | ≈ 0.01065 OKB |
+| 1 | 0.00065 + 1 wei | ≈ 0.00065 OKB |
+| 10 | 0.00065 + 10 wei | ≈ 0.00065 OKB |
+| 100 | 0.00065 + 100 wei | ≈ 0.00065 OKB |
+
+> 单价取合约实时值：不同 CPU 差异很大。旧 `FAB_No1` 的 `mintPrice` 是 0.0001 OKB/枚，
+> 而 v2 `RefBench` 只有 1 wei/枚——此时费用几乎全由 **协议费** 决定。
 
 **省费要点**：协议费是「每笔」收一次，拆成多笔就多付。默认对 NAND + LATCH 各发一笔，
 即每账号 2 笔协议费；想省钱就用 `--token-ids` 只买需要的那个，并把数量合并到一笔。
@@ -328,8 +331,13 @@ uv run fabx web
 
 站点前端打包产物里内联了 13 套 ABI：
 
-- `https://fabx.tech/assets/abi.generated-CtIRDRwc.js`
-- `https://fabx.tech/assets/config-DJaFdDfO.js`（合约地址）
+- `https://fabx.tech/assets/abi.generated-CtIRDRwc.js`（ABI 定义，长期稳定）
+- `https://fabx.tech/assets/config-DJaFdDfO.js`（v1 部署的合约地址，已随整站重部署失效）
+- `https://fabx.tech/assets/config-BhXPazbF.js`（当前 v2 部署的合约地址）
+
+> 站点会「整站重新部署」并同时更换工厂、市场、PodMining 等全套地址（文件名哈希也会变）。
+> 一旦 `fabx cpu list` 读到的额度与实际页面不符，先抓最新 `assets/config-*.js` 里的
+> `VITE_*` 地址，覆盖 `FABX_CIRCUIT_FACTORY_ADDRESS` 等环境变量即可。
 
 提取结果保存在 [`src/fabx_minter/abi/fabx.abi.json`](src/fabx_minter/abi/fabx.abi.json)，
 键名与前端导出一致（`transistorsAbi`、`circuitsAbi`、`circuitFactoryAbi` …）。
@@ -340,8 +348,9 @@ uv run fabx web
 | --- | --- |
 | 网络 | X Layer，chainId `196` |
 | RPC | `https://rpc.xmake.org/rpc/196` |
-| 工厂合约 | `0x138fA3B38b1461B5908C455ABD30fC55029b7e71`（`cpuCount()` / `cpuAt(i)`） |
-| 晶体管合约（mint 目标） | `0x9d2e9B9c668877C34cd1F5836338adCF724d0Ec1`（`FAB_No1`） |
+| 工厂合约（v2） | `0x82935793a854fA2F2e8A9d2B3F17BbfBf81D6C05`（`cpuCount()` / `cpuAt(i)`） |
+| 晶体管合约（当前 mint 目标） | `0x158341E42F00f658C86e3d42bC4c397Df16795DA`（`RefBench`） |
+| 旧工厂（v1，已售罄） | `0x138fA3B38b1461B5908C455ABD30fC55029b7e71` |
 | mint 方法 | `mint(uint256 id, uint256 amount)`，payable |
 | 应付金额 | `protocolFee() + mintPrice() * amount` |
 | token id | `NAND()` / `LATCH()` 分别给出 id 0 与 1 |
@@ -350,27 +359,42 @@ uv run fabx web
 一次性核验命令：
 
 ```bash
-uv run fabx cpu state 0x9d2e9B9c668877C34cd1F5836338adCF724d0Ec1
+# 直接读官方 CPU 列表（含当前 mintPrice / 剩余额度）
+curl -s https://api.fabx.tech/v1/processors | python3 -m json.tool
+# 或本地读链上状态
+uv run fabx cpu state 0x158341E42F00f658C86e3d42bC4c397Df16795DA
 ```
 
 ## 合约状态备注
 
-逆向时点（2026-10 上旬）核验：
+逆向时点（2026-10-12）核验：
 
-- `FAB_No1`（`0x9d2e9B9c668877C34cd1F5836338adCF724d0Ec1`）**已售罄**：
-  链上 `minted = 1,000,000`、`supplyCap = 1,000,000`，NAND / LATCH 剩余额度均为 0，
-  累计 `Minted` 事件 1,000,000 笔、覆盖 743 个地址、实付 101.8642 OKB。
-  该合约 ABI 不含 `startTime` / `paused` / `phase`，无“未开始”状态可言——除非 owner 提额，
-  否则无法再 mint。
-- `RefBench`（`0xBCcf156bCc711Ade5D62E6aCD4F0D4567Ada4C3D`）**已售罄**：
-  链上 `minted = 14,000`、`supplyCap = 14,000`，NAND / LATCH 剩余额度均为 0。
-  两个已知合约均已售罄，当前工厂 `cpuCount() = 2`；`fabx auto --target new` 就是为
-  等待下一个新合约部署而准备的。
+- 旧工厂 `0x138fA3B3…`（v1）下两个 CPU 全部**已售罄**：`FAB_No1`（`0x9d2e…Ec1`）
+  `minted == supplyCap == 1,000,000`、`RefBench`（`0xBCcf…4C3D`）
+  `minted == supplyCap == 14,000`，NAND / LATCH 剩余额度均为 0。ABI 里没有
+  `startTime` / `paused` / `phase`，因此不存在“未开始”——`minted == supplyCap` 就是售罄，
+  除非 owner 提额，否则无法再 mint。
+- 站点随后**整站重部署**，工厂换到 `0x82935793…`（v2）。新工厂 `cpuCount() = 1`，
+  唯一 CPU 是 `RefBench`（晶体管 `0x158341E4…95DA`）：`mintPrice = 1 wei`、
+  `protocolFee = 0.00065 OKB`、`supplyCap = 14,000`，仍有额度可 mint。
+- `fabx auto --target new` 会在启动时记录工厂 CPU 数量作为基线，等待工厂**新增** CPU
+  后再动手，适合「活动开新合约」的抢跑场景；只要没有新合约部署，它就一直在等。
 
 ## 常见问题
 
-- **是“已售罄”还是“没开始”？** 这两个合约的 ABI 里没有 `startTime` / `paused` / `phase`，
-  不存在“未开始”这种状态。链上 `minted == supplyCap`、剩余额度为 0，就是**售罄**。
+- **是“已售罄”还是“没开始”？** 合约 ABI 里没有 `startTime` / `paused` / `phase`，
+  不存在“未开始”这种状态。链上 `minted == supplyCap`、剩余额度为 0，就是**售罄**；
+  整站重部署换到新工厂后，旧合约售罄 ≠ 新合约没开始。
+- **“每天都有代币产出”，是不是每天都能 mint？** 不是一回事。这里的“每天产出”指的是
+  `$FAB` 的**挖矿发行**：官网规则为首期 7,200 枚/天、每秒连续发行、约 4 年减半
+  （上限 21,000,000，8 位小数），99% 按算力分给已验证矿工池、1% 给未验证池。
+  而 **mint 晶体管**只是铸造 ERC1155 晶体管（NAND / LATCH）这一有限额度的动作，
+  与“每天”无关——只要 CPU 合约还有 `supplyCap` 额度就随时能 mint，售罄就停；
+  mint 本身不直接产出 `$FAB`，没有“每天能 mint 一次”这种机制。
+- **mint 晶体管就等于挖矿吗？** 不等于。官网「如何挖矿」是 5 步：选题目 → 备晶体管
+  （mint / 交易得到 NAND、LATCH）→ 设计电路（画布）→ 流片 Tape out（燃烧晶体管、
+  链上铸造电路、永久归属）→ 启动矿机。本工具目前只覆盖其中的备料环节（mint 晶体管），
+  真正产出 `$FAB` 需要后续设计、流片、启动矿机。
 - **任务全部 `skipped`？** 常见原因是合约已售罄，或账号 OKB 不足以覆盖
   `协议费 + 单价×数量 + gas`。用 `fabx cpu state <地址>` 与 `fabx account list --balance` 排查。
 - **报 value 不足 / 交易 revert？** 多半是漏算协议费。本工具已把 `protocolFee` 计入
