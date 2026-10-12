@@ -130,28 +130,54 @@ class MintEngine:
             # None 表示该类型未单独设限（typeCap=0），此时不封顶。
             budget = remaining
             planned_here = 0
-            for account in accounts:
-                amount = target.amount if budget is None else min(target.amount, budget)
-                if amount <= 0:
-                    break
+            if target.fill:
+                # fill 语义：忽略 amount，把当前全局剩余「全部交给第一个账号」。
+                # 刻意不再按账号均分：调用方要的是尽快吃满额度，而不是每人一份；
+                # 剩余量未知（None）时无法给出确定上限，直接拒绝以免生成超大交易。
+                if budget is None:
+                    notes.append(
+                        f"{target.transistors} tokenId={target.token_id} 无供应上限，"
+                        f"fill 模式无法确定数量，已跳过；请改用 --amount"
+                    )
+                    continue
+                if budget <= 0:
+                    continue
+                first = accounts[0]
                 planned.append(
                     PlannedTask(
-                        account_id=account.id,
-                        address=account.address,
+                        account_id=first.id,
+                        address=first.address,
                         transistors=state.address,
                         token_id=target.token_id,
-                        amount=amount,
-                        value_wei=state.cost_wei(amount),
+                        amount=budget,
+                        value_wei=state.cost_wei(budget),
                         note=target.label,
                     )
                 )
-                planned_here += amount
-                if budget is not None:
-                    budget -= amount
+                planned_here = budget
+            else:
+                for account in accounts:
+                    amount = target.amount if budget is None else min(target.amount, budget)
+                    if amount <= 0:
+                        break
+                    planned.append(
+                        PlannedTask(
+                            account_id=account.id,
+                            address=account.address,
+                            transistors=state.address,
+                            token_id=target.token_id,
+                            amount=amount,
+                            value_wei=state.cost_wei(amount),
+                            note=target.label,
+                        )
+                    )
+                    planned_here += amount
+                    if budget is not None:
+                        budget -= amount
             # 每个已规划的 mint 都会占用一份全局供应额度，无论它是否受 typeCap 约束，
             # 因此这里统一累计，供同一合约的后续目标扣减。
             supply_used[address_key] = consumed + planned_here
-            if remaining is not None and planned_here < target.amount * len(accounts):
+            if not target.fill and remaining is not None and planned_here < target.amount * len(accounts):
                 notes.append(
                     f"{target.transistors} tokenId={target.token_id} 剩余 {remaining}，"
                     f"本次合计安排 {planned_here} 笔（按剩余额度封顶）"

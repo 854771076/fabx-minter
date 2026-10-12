@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -13,6 +14,7 @@ from rich.table import Table
 
 from .accounts import import_many
 from .chain import (
+    fetch_pod_tasks,
     format_okb,
     make_web3,
     native_balance,
@@ -23,8 +25,9 @@ from .config import get_settings, is_loopback_host
 from .crypto import resolve_password
 from .db import Database
 from .funding import distribute_funds
+from .mining import MiningEngine, MiningError
 from .minter import MintEngine
-from .models import FundRequest, JobIn, MintTarget
+from .models import FundRequest, JobIn, MintTarget, TapeoutRequest
 from .scheduler import AutoConfig, resolve_start_time, run_auto
 
 console = Console()
@@ -37,9 +40,11 @@ app = typer.Typer(
 account_app = typer.Typer(help="账号管理（私钥加密入库）。", no_args_is_help=True)
 job_app = typer.Typer(help="铸造任务编排。", no_args_is_help=True)
 cpu_app = typer.Typer(help="CPU / 合约信息。", no_args_is_help=True)
+mine_app = typer.Typer(help="PoD 深度挖矿（tapeout / arm / start / claim）。", no_args_is_help=True)
 app.add_typer(account_app, name="account")
 app.add_typer(job_app, name="job")
 app.add_typer(cpu_app, name="cpu")
+app.add_typer(mine_app, name="mine")
 
 
 def _db() -> Database:
@@ -203,6 +208,10 @@ def job_create(
     transistors: Annotated[str, typer.Option("--transistors", "-t", help="晶体管合约地址")],
     token_id: Annotated[int, typer.Option("--token-id", "-i", help="token id（NAND/LATCH 见 cpu state）")],
     amount: Annotated[int, typer.Option("--amount", "-n", help="每账号铸造数量")] = 1,
+    fill: Annotated[
+        bool,
+        typer.Option("--fill", help="吃满剩余额度：忽略 --amount，把全局剩余全部交给第一个账号"),
+    ] = False,
     name: Annotated[str | None, typer.Option("--name", help="任务名称")] = None,
     group: Annotated[str | None, typer.Option("--group", "-g")] = None,
     accounts: Annotated[str | None, typer.Option("--accounts", "-a", help="账号 ID，逗号分隔")] = None,
@@ -213,8 +222,16 @@ def job_create(
     """创建铸造任务（只落库，不广播）。"""
     _setup_logging(verbose)
     job = JobIn(
-        name=name or f"mint {transistors} id={token_id} x{amount}",
-        targets=[MintTarget(transistors=transistors, token_id=token_id, amount=amount)],
+        name=name
+        or (f"mint {transistors} id={token_id} fill" if fill else f"mint {transistors} id={token_id} x{amount}"),
+        targets=[
+            MintTarget(
+                transistors=transistors,
+                token_id=token_id,
+                amount=amount,
+                fill=fill,
+            )
+        ],
         account_ids=_parse_ids(accounts),
         group=group,
         stop_on_first_failure=stop_on_first_failure,
@@ -386,6 +403,267 @@ def fund(
     )
     for note in result.notes:
         console.print(f"  · {note}")
+
+
+# ---------------------------------------------------------------------- 挖矿
+def _mining() -> MiningEngine:
+    return MiningEngine(_db(), get_settings())
+
+
+def _parse_gates(text: str) -> list[list[object]]:
+    """解析 `--gates` 的 JSON 门列表，例如 `[["NAND",2,2]]`。"""
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise typer.BadParameter(f"gates 不是合法 JSON：{exc}") from exc
+    if not isinstance(parsed, list) or not parsed:
+        raise typer.BadParameter("gates 必须是非空数组，例如 '[[\"NAND\",2,2]]'")
+    return parsed
+
+
+@mine_app.command("status")
+def mine_status() -> None:
+    """查看 PoD 挖矿全局状态（是否已启动、速率、任务数、矿池权重）。"""
+    try:
+        status = _mining().global_status()
+    except Exception as exc:
+        console.print(f"[red]读取挖矿状态失败：{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    table = Table("项", "值")
+    table.add_row("链", f"{status.chain_id}")
+    table.add_row("PodMining", status.mining)
+    table.add_row("状态", "已启动" if status.started else "未启动（等待官方开启）")
+    table.add_row("启动时间", status.start_time_human)
+    table.add_row("当前速率", str(status.current_rate))
+    table.add_row("已产出总量", str(status.total_mined))
+    table.add_row("每日产出", str(status.daily_emission))
+    table.add_row("当前纪元", str(status.current_era))
+    table.add_row("暂停", "是" if status.paused else "否")
+    table.add_row("任务数", str(status.task_count))
+    table.add_row("矿机数", str(status.miner_count))
+    table.add_row(
+        "池权重（已验证/未验证）",
+        f"{status.pool_verif_weight} / {status.pool_unver_weight}",
+    )
+    table.add_row(
+        "池矿机（已验证/总计）",
+        f"{status.pool_verif_miners} / {status.pool_miners}",
+    )
+    table.add_row("未验证 bps", str(status.pool_unver_bps))
+    console.print(table)
+
+
+@mine_app.command("tasks")
+def mine_tasks(limit: Annotated[int, typer.Option("--limit", "-l")] = 20) -> None:
+    """列出官方 PoD 任务表。"""
+    try:
+        tasks = fetch_pod_tasks(get_settings())
+    except Exception as exc:
+        console.print(f"[red]拉取任务失败：{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    if not tasks:
+        console.print("[yellow]暂无任务[/yellow]")
+        return
+    table = Table("taskId", "名称", "类型", "cycles", "nIn", "nOut", "tier", "向量数")
+    for row in tasks[:limit]:
+        table.add_row(
+            str(row.get("taskId")),
+            str(row.get("name")),
+            str(row.get("kind")),
+            str(row.get("cycles")),
+            str(row.get("nIn")),
+            str(row.get("nOut")),
+            str(row.get("tier")),
+            str(row.get("vectorCount")),
+        )
+    console.print(table)
+
+
+@mine_app.command("preflight")
+def mine_preflight(
+    task_id: Annotated[int, typer.Option("--task", help="任务 ID")],
+    gates: Annotated[str, typer.Option("--gates", help='门列表 JSON，如 \'[["NAND",2,2]]\'')],
+    no_local: Annotated[bool, typer.Option("--no-local", help="跳过本地逐向量校验")] = False,
+) -> None:
+    """提交前预检：官方 verify + 本地逐向量校验。"""
+    try:
+        result = _mining().preflight(task_id, _parse_gates(gates), local_check=not no_local)
+    except (ValueError, MiningError) as exc:
+        console.print(f"[red]预检失败：{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    table = Table("项", "值")
+    for key in (
+        "pass",
+        "passed",
+        "total",
+        "nand",
+        "latch",
+        "cost",
+        "hashrate",
+        "bonus",
+        "first",
+        "local_ok",
+        "local_passed",
+        "local_total",
+        "netlist_hex",
+    ):
+        if key in result:
+            table.add_row(key, str(result[key]))
+    console.print(table)
+    if not result.get("pass"):
+        console.print("[yellow]官方预检未通过，不要 tapeout[/yellow]")
+        raise typer.Exit(code=1)
+
+
+@mine_app.command("tapeout")
+def mine_tapeout(
+    account_id: Annotated[int, typer.Option("--account", "-a", help="账号 ID")],
+    gates: Annotated[str, typer.Option("--gates", help='门列表 JSON，如 \'[["NAND",2,2]]\'')],
+    n_in: Annotated[int, typer.Option("--n-in")] = 1,
+    n_out: Annotated[int, typer.Option("--n-out")] = 1,
+    circuits_addr: Annotated[str | None, typer.Option("--circuits", help="电路合约；留空用默认")] = None,
+    commit: Annotated[bool, typer.Option("--commit", help="先提交设计承诺防抢跑")] = False,
+    label: Annotated[str | None, typer.Option("--label")] = None,
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+) -> None:
+    """把网表 tapeout 成电路 NFT（烧晶体管，付固定费用）。"""
+    request = TapeoutRequest(
+        account_id=account_id,
+        gates=_parse_gates(gates),
+        n_in=n_in,
+        n_out=n_out,
+        circuits=circuits_addr,
+        label=label,
+        commit=commit,
+        dry_run=dry_run,
+    )
+    try:
+        result = _mining().tapeout(request)
+    except (ValueError, MiningError) as exc:
+        console.print(f"[red]tapeout 失败：{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]电路 #{result.circuit_id} 已{'模拟' if dry_run else '铸造'}[/green]")
+    console.print(f"  合约:   {result.circuits}")
+    console.print(f"  交易:   {result.tx_hash}")
+    console.print(
+        f"  费用:   {format_okb(result.fee_wei)} OKB，烧 NAND {result.nand_burn} / "
+        f"LATCH {result.latch_burn}"
+    )
+    console.print(
+        f"  预估:   b*={result.bstar} area={result.area} depth={result.depth} cost={result.cost}"
+    )
+
+
+@mine_app.command("arm")
+def mine_arm(
+    account_id: Annotated[int, typer.Option("--account", "-a")],
+    circuit_id: Annotated[int, typer.Option("--circuit-id", "-i")],
+    circuits_addr: Annotated[str | None, typer.Option("--circuits")] = None,
+) -> None:
+    """给电路上膛，取得采样锚点区块。"""
+    address = circuits_addr or get_settings().default_circuits_address
+    try:
+        result = _mining().arm(account_id, address, circuit_id)
+    except (ValueError, MiningError) as exc:
+        console.print(f"[red]arm 失败：{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print(
+        f"[green]已 arm 电路 #{circuit_id}，锚点区块 {result.anchor_block}，"
+        f"key {result.key}[/green]"
+    )
+
+
+@mine_app.command("start")
+def mine_start(
+    account_id: Annotated[int, typer.Option("--account", "-a")],
+    circuit_id: Annotated[int, typer.Option("--circuit-id", "-i")],
+    task_id: Annotated[int, typer.Option("--task", help="任务 ID")],
+    circuits_addr: Annotated[str | None, typer.Option("--circuits")] = None,
+    anchor: Annotated[int | None, typer.Option("--anchor", help="已 arm 的锚点区块；留空则自动 arm")] = None,
+    salt: Annotated[str | None, typer.Option("--salt", help="设计盐（与 commit 一致）；留空用本地记录")] = None,
+) -> None:
+    """启动挖矿：arm（如需）-> 采样 -> start。"""
+    address = circuits_addr or get_settings().default_circuits_address
+    try:
+        result = _mining().start(
+            account_id, address, circuit_id, task_id, anchor_block=anchor, salt=salt
+        )
+    except (ValueError, MiningError) as exc:
+        console.print(f"[red]start 失败：{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print(
+        f"[green]电路 #{circuit_id} 已启动挖矿：提交 {result.samples} 个样本，"
+        f"锚点 {result.anchor_block}，key {result.key}[/green]"
+    )
+
+
+@mine_app.command("claim")
+def mine_claim(
+    account_id: Annotated[int, typer.Option("--account", "-a")],
+    keys: Annotated[str, typer.Option("--keys", help="矿机 key，逗号分隔；多个合并成一笔")],
+) -> None:
+    """领取矿机产出的代币。"""
+    parsed = [k.strip() for k in keys.split(",") if k.strip()]
+    try:
+        result = _mining().claim(account_id, parsed)
+    except (ValueError, MiningError) as exc:
+        console.print(f"[red]claim 失败：{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]已领取 {result.samples} 台矿机产出，交易 {result.tx_hash}[/green]")
+
+
+@mine_app.command("stop")
+def mine_stop(
+    account_id: Annotated[int, typer.Option("--account", "-a")],
+    key: Annotated[str, typer.Option("--key", help="矿机 key")],
+) -> None:
+    """停机（进入冷却，之后可 reclaim）。"""
+    try:
+        result = _mining().stop(account_id, key)
+    except (ValueError, MiningError) as exc:
+        console.print(f"[red]stop 失败：{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]已停机 {result.key}，交易 {result.tx_hash}[/green]")
+
+
+@mine_app.command("reclaim")
+def mine_reclaim(
+    account_id: Annotated[int, typer.Option("--account", "-a")],
+    key: Annotated[str, typer.Option("--key", help="矿机 key")],
+) -> None:
+    """回收晶体管（停机冷却结束后）。"""
+    try:
+        result = _mining().reclaim(account_id, key)
+    except (ValueError, MiningError) as exc:
+        console.print(f"[red]reclaim 失败：{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]已回收 {result.key}，交易 {result.tx_hash}[/green]")
+
+
+@mine_app.command("list")
+def mine_list(
+    account_id: Annotated[int | None, typer.Option("--account", "-a")] = None,
+    circuits_addr: Annotated[str | None, typer.Option("--circuits")] = None,
+) -> None:
+    """列出本地记录的电路（tapeout 产物）。"""
+    rows = _db().list_circuits(account_id=account_id, circuits=circuits_addr)
+    if not rows:
+        console.print("[yellow]暂无电路记录[/yellow]")
+        return
+    table = Table("ID", "账号", "电路", "circuitId", "nIn", "nOut", "门数", "task", "矿机 key")
+    for row in rows:
+        table.add_row(
+            str(row.id),
+            row.address or str(row.account_id),
+            row.circuits[:10] + "…",
+            str(row.circuit_id),
+            str(row.n_in),
+            str(row.n_out),
+            str(row.gate_count),
+            str(row.task_id) if row.task_id is not None else "-",
+            (row.miner_key[:10] + "…") if row.miner_key else "-",
+        )
+    console.print(table)
 
 
 # ----------------------------------------------------------------------- 定时

@@ -24,7 +24,7 @@ from web3.contract import Contract
 from . import abi as abi_mod
 from .config import Settings
 from .db import Database
-from .models import CpuOut
+from .models import CpuOut, MinerInfo, MiningStatus
 
 log = logging.getLogger("fabx.chain")
 
@@ -48,6 +48,22 @@ def make_web3(settings: Settings) -> Web3:
 
 def transistors_contract(w3: Web3, address: str) -> Contract:
     return w3.eth.contract(address=Web3.to_checksum_address(address), abi=abi_mod.load_abi("transistorsAbi"))
+
+
+def pod_mining_contract(w3: Web3, settings: Settings) -> Contract:
+    """PoD 挖矿主合约：arm / start / claim / stop 都在这里。"""
+    return w3.eth.contract(
+        address=Web3.to_checksum_address(settings.pod_mining_address),
+        abi=abi_mod.load_abi("podMiningAbi"),
+    )
+
+
+def pod_lens_contract(w3: Web3, settings: Settings) -> Contract:
+    """PoD 只读透镜：采样下标、任务参考、预估都在这里，不产生交易。"""
+    return w3.eth.contract(
+        address=Web3.to_checksum_address(settings.pod_lens_address),
+        abi=abi_mod.load_abi("podLensAbi"),
+    )
 
 
 def _abi_function_names(abi_name: str) -> frozenset[str]:
@@ -239,3 +255,175 @@ def format_okb(wei: int) -> str:
         return str(whole)
     text = f"{frac:018d}".rstrip("0")
     return f"{whole}.{text}"
+
+
+# ------------------------------------------------------------------ 挖矿读取
+
+# 挖矿尚未开始时，``startTime`` 被合约初始化成 uint64 最大值占位。
+NOT_STARTED_SENTINEL = (1 << 64) - 1
+
+# Miner.status 的链上取值含义（见前端 pod 产物）。
+MINER_STATUS_TEXT = {0: "none", 1: "active", 2: "revoked", 3: "cooling"}
+
+
+def read_mining_status(w3: Web3, settings: Settings) -> MiningStatus:
+    """汇总 PoD 挖矿的全局状态：是否已启动、当前产出速率、矿池权重。"""
+    mining = pod_mining_contract(w3, settings)
+    lens = pod_lens_contract(w3, settings)
+    start_time = int(mining.functions.startTime().call())
+    pool = lens.functions.poolInfo().call()
+    started = start_time != NOT_STARTED_SENTINEL
+    human = "未启动（等待官方开启）"
+    if started:
+        human = datetime.fromtimestamp(start_time, timezone.utc).isoformat(timespec="seconds")
+    return MiningStatus(
+        chain_id=settings.chain_id,
+        mining=Web3.to_checksum_address(settings.pod_mining_address),
+        token=Web3.to_checksum_address(mining.functions.token().call()),
+        started=started,
+        start_time=start_time,
+        start_time_human=human,
+        current_rate=int(mining.functions.currentRate().call()),
+        total_mined=int(mining.functions.totalMined().call()),
+        daily_emission=int(lens.functions.dailyEmission().call()),
+        current_era=int(lens.functions.currentEra().call()),
+        paused=bool(mining.functions.paused().call()),
+        task_count=int(mining.functions.taskCount().call()),
+        miner_count=int(mining.functions.minerCount().call()),
+        pool_verif_weight=int(pool[0]),
+        pool_unver_weight=int(pool[1]),
+        pool_verif_miners=int(pool[2]),
+        pool_miners=int(pool[3]),
+        pool_unver_bps=int(pool[4]),
+    )
+
+
+def read_tapeout_fee(w3: Web3, circuits_address: str) -> int:
+    """读取某电路合约当前的 tapeout 固定费用（wei）。"""
+    contract = circuits_contract(w3, circuits_address)
+    return int(contract.functions.TAPEOUT_FEE().call())
+
+
+def read_circuit_info(w3: Web3, circuits_address: str, circuit_id: int) -> tuple[int, int, int, int]:
+    """返回 ``(nIn, nOut, nState, gateCount)``；电路不存在时链上会直接 revert。"""
+    contract = circuits_contract(w3, circuits_address)
+    info = contract.functions.circuitInfo(int(circuit_id)).call()
+    return int(info[0]), int(info[1]), int(info[2]), int(info[3])
+
+
+def read_circuit_netlist(w3: Web3, circuits_address: str, circuit_id: int) -> bytes:
+    contract = circuits_contract(w3, circuits_address)
+    return bytes(contract.functions.netlist(int(circuit_id)).call())
+
+
+def read_miner_key(w3: Web3, settings: Settings, circuits_address: str, circuit_id: int) -> str:
+    """``minerKey`` 是纯函数（keccak(circuits, circuitId)），链上本地都能算。"""
+    mining = pod_mining_contract(w3, settings)
+    return Web3.to_hex(mining.functions.minerKey(
+        Web3.to_checksum_address(circuits_address), int(circuit_id)
+    ).call())
+
+
+def read_miner(w3: Web3, settings: Settings, key: str) -> MinerInfo | None:
+    """读一个矿机快照；矿机不存在（registrant 为零地址）时返回 None。"""
+    mining = pod_mining_contract(w3, settings)
+    row = mining.functions.getMiner(key).call()
+    registrant = Web3.to_checksum_address(row[10])
+    if int(row[9]) == 0 and registrant == Web3.to_checksum_address("0x" + "0" * 40):
+        return None
+    pending = 0
+    try:
+        pending = int(mining.functions.pending(key).call())
+    except Exception as exc:  # 领取代币合约异常不应让状态查询整体失败
+        log.warning("读取 %s 的 pending 失败: %s", key, exc)
+    status = int(row[9])
+    return MinerInfo(
+        key=key,
+        circuits=Web3.to_checksum_address(row[0]),
+        circuit_id=int(row[1]),
+        task_id=int(row[2]),
+        gate_count=int(row[3]),
+        state_count=int(row[4]),
+        depth=int(row[5]),
+        area=int(row[6]),
+        mult=int(row[7]),
+        since=int(row[8]),
+        status=status,
+        status_text=MINER_STATUS_TEXT.get(status, f"unknown({status})"),
+        registrant=registrant,
+        nand_burn=int(row[11]),
+        latch_burn=int(row[12]),
+        bstar=int(row[13]),
+        bonus=int(row[14]),
+        optimal=bool(row[15]),
+        commit_block=int(row[16]),
+        first_unused_id=int(row[17]),
+        stop_block=int(row[18]),
+        verif_weight=int(row[19]),
+        unver_weight=int(row[20]),
+        debt=int(row[21]),
+        boost_bps=int(row[22]),
+        pending_wei=pending,
+    )
+
+
+def sample_indexes(
+    w3: Web3,
+    settings: Settings,
+    circuits_address: str,
+    circuit_id: int,
+    task_id: int,
+    anchor_block: int,
+) -> list[int]:
+    """取该矿机本次要提交的样本下标（由 anchorBlock 的区块哈希派生，链上可复算）。"""
+    lens = pod_lens_contract(w3, settings)
+    idx = lens.functions.sampleIndexes(
+        Web3.to_checksum_address(circuits_address),
+        int(circuit_id),
+        int(task_id),
+        int(anchor_block),
+    ).call()
+    return [int(i) for i in idx]
+
+
+def preview_burn_onchain(w3: Web3, settings: Settings, netlist: bytes) -> tuple[int, int]:
+    """链上预估 tapeout 会烧掉多少 NAND / LATCH（``previewBurn``）。
+
+    tapeout 只能由电路合约内部调用 ``transistors.burnFrom``，用户无法自行销毁晶体管，
+    因此铸造前必须用这个只读接口确认余额够不够烧，否则交易必然 revert。
+    """
+    lens = pod_lens_contract(w3, settings)
+    burn = lens.functions.previewBurn(bytes(netlist)).call()
+    return int(burn[0]), int(burn[1])
+
+
+def fetch_pod_tasks(settings: Settings) -> list[dict[str, Any]]:
+    """官方挖矿任务表（与前端同源），含 nIn/nOut/cycles/参考电路/向量根。"""
+    url = f"{settings.api_url.rstrip('/')}/v1/pod/tasks"
+    with httpx.Client(timeout=settings.rpc_timeout) as client:
+        resp = client.get(url, params={"chainId": settings.chain_id})
+        resp.raise_for_status()
+        payload = resp.json()
+    return list(payload.get("data") or [])
+
+
+def fetch_pod_vectors(settings: Settings, task_id: int) -> dict[str, Any]:
+    """某个任务的全部官方向量（input/expectedOut/proof），用于本地预检与 start。"""
+    url = f"{settings.api_url.rstrip('/')}/v1/pod/tasks/{int(task_id)}/vectors"
+    with httpx.Client(timeout=settings.rpc_timeout) as client:
+        resp = client.get(url, params={"chainId": settings.chain_id})
+        resp.raise_for_status()
+        return dict(resp.json())
+
+
+def verify_design(settings: Settings, task_id: int, gates: list[Any]) -> dict[str, Any]:
+    """调用官方 verify 接口做「提交前的权威预检」，返回 pass/得分/算力等信息。"""
+    url = f"{settings.api_url.rstrip('/')}/v1/pod/verify"
+    with httpx.Client(timeout=settings.rpc_timeout) as client:
+        resp = client.post(
+            url,
+            params={"chainId": settings.chain_id},
+            json={"taskId": int(task_id), "gates": gates},
+        )
+        resp.raise_for_status()
+        return dict(resp.json())

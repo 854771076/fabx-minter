@@ -18,6 +18,8 @@ from typing import Any, Iterable, Iterator, Sequence
 
 from .models import (
     AccountOut,
+    CircuitIn,
+    CircuitOut,
     CpuOut,
     JobOut,
     JobStatus,
@@ -25,7 +27,7 @@ from .models import (
     TaskStatus,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -100,6 +102,29 @@ CREATE TABLE IF NOT EXISTS events (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_events_job ON events(job_id);
+
+-- tapeout 产出的电路 NFT（ERC721）。salt 必须随记录保存：commit 与 start
+-- 必须使用同一个 salt，否则链上承诺校验失败。
+CREATE TABLE IF NOT EXISTS circuits (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id   INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    circuits     TEXT NOT NULL,
+    circuit_id   INTEGER NOT NULL,
+    n_in         INTEGER NOT NULL,
+    n_out        INTEGER NOT NULL,
+    n_state      INTEGER NOT NULL,
+    gate_count   INTEGER NOT NULL,
+    label        TEXT,
+    salt         TEXT,
+    task_id      INTEGER,
+    miner_key    TEXT,
+    tx_hash      TEXT,
+    block_number INTEGER,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    UNIQUE (circuits, circuit_id)
+);
+CREATE INDEX IF NOT EXISTS idx_circuits_account ON circuits(account_id);
 """
 
 
@@ -115,7 +140,10 @@ class Database:
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
             conn.execute(
-                "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)",
+                """
+                INSERT INTO meta(key, value) VALUES ('schema_version', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
                 (str(SCHEMA_VERSION),),
             )
 
@@ -289,6 +317,140 @@ class Database:
             )
             for r in rows
         ]
+
+    # ---------------------------------------------------------------- circuits
+    def add_circuit(self, circuit: CircuitIn) -> int:
+        """写入一条 tapeout 产物；(circuits, circuit_id) 重复时更新可变字段。
+
+        同一电路不可能被重复 tapeout（链上 id 单调递增），重复多半来自「重跑同一批
+        任务时补写记录」。此时保留已有 salt / task_id / miner_key，只覆盖
+        n_in/n_out 这类可重算字段，避免把已经用于 start 的 salt 抹掉。
+        """
+        now = utcnow()
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO circuits(account_id, circuits, circuit_id, n_in, n_out,
+                                     n_state, gate_count, label, salt, task_id,
+                                     miner_key, tx_hash, block_number,
+                                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(circuits, circuit_id) DO UPDATE SET
+                    account_id   = excluded.account_id,
+                    n_in         = excluded.n_in,
+                    n_out        = excluded.n_out,
+                    n_state      = excluded.n_state,
+                    gate_count   = excluded.gate_count,
+                    label        = COALESCE(excluded.label, circuits.label),
+                    salt         = COALESCE(excluded.salt, circuits.salt),
+                    task_id      = COALESCE(excluded.task_id, circuits.task_id),
+                    miner_key    = COALESCE(excluded.miner_key, circuits.miner_key),
+                    tx_hash      = COALESCE(excluded.tx_hash, circuits.tx_hash),
+                    block_number = COALESCE(excluded.block_number, circuits.block_number),
+                    updated_at   = excluded.updated_at
+                """,
+                (
+                    circuit.account_id,
+                    circuit.circuits.lower(),
+                    circuit.circuit_id,
+                    circuit.n_in,
+                    circuit.n_out,
+                    circuit.n_state,
+                    circuit.gate_count,
+                    circuit.label,
+                    circuit.salt,
+                    circuit.task_id,
+                    circuit.miner_key,
+                    circuit.tx_hash,
+                    circuit.block_number,
+                    now,
+                    now,
+                ),
+            )
+            if cur.lastrowid:
+                return int(cur.lastrowid)
+            row = conn.execute(
+                "SELECT id FROM circuits WHERE circuits = ? AND circuit_id = ?",
+                (circuit.circuits.lower(), circuit.circuit_id),
+            ).fetchone()
+            return int(row["id"])
+
+    def set_circuit_miner(
+        self,
+        *,
+        circuits: str,
+        circuit_id: int,
+        task_id: int,
+        miner_key: str,
+    ) -> None:
+        """start 成功后回填该电路对应的任务号与矿机 key，便于后续 claim/stop。"""
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE circuits
+                SET task_id = ?, miner_key = ?, updated_at = ?
+                WHERE circuits = ? AND circuit_id = ?
+                """,
+                (task_id, miner_key, utcnow(), circuits.lower(), circuit_id),
+            )
+
+    def list_circuits(
+        self,
+        *,
+        account_id: int | None = None,
+        circuits: str | None = None,
+        limit: int = 500,
+    ) -> list[CircuitOut]:
+        sql = """
+            SELECT c.*, a.address AS address
+            FROM circuits c LEFT JOIN accounts a ON a.id = c.account_id
+            WHERE 1 = 1
+        """
+        params: list[Any] = []
+        if account_id is not None:
+            sql += " AND c.account_id = ?"
+            params.append(account_id)
+        if circuits:
+            sql += " AND c.circuits = ?"
+            params.append(circuits.lower())
+        sql += " ORDER BY c.id DESC LIMIT ?"
+        params.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._row_to_circuit(r) for r in rows]
+
+    def get_circuit(self, circuits: str, circuit_id: int) -> CircuitOut | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT c.*, a.address AS address
+                FROM circuits c LEFT JOIN accounts a ON a.id = c.account_id
+                WHERE c.circuits = ? AND c.circuit_id = ?
+                """,
+                (circuits.lower(), circuit_id),
+            ).fetchone()
+        return self._row_to_circuit(row) if row else None
+
+    @staticmethod
+    def _row_to_circuit(row: sqlite3.Row) -> CircuitOut:
+        return CircuitOut(
+            id=int(row["id"]),
+            account_id=int(row["account_id"]),
+            circuits=row["circuits"],
+            circuit_id=int(row["circuit_id"]),
+            n_in=int(row["n_in"]),
+            n_out=int(row["n_out"]),
+            n_state=int(row["n_state"]),
+            gate_count=int(row["gate_count"]),
+            label=row["label"],
+            salt=row["salt"],
+            tx_hash=row["tx_hash"],
+            block_number=row["block_number"],
+            address=row["address"] if "address" in row.keys() else None,
+            created_at=datetime.fromisoformat(row["created_at"]),
+            task_id=row["task_id"],
+            miner_key=row["miner_key"],
+        )
 
     # -------------------------------------------------------------------- jobs
     def create_job(self, name: str, config: dict[str, Any], *, dry_run: bool) -> int:

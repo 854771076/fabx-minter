@@ -21,6 +21,7 @@
 - [定时调度（到点自动 mint）](#定时调度到点自动-mint)
 - [动态 gas 与链上拥堵](#动态-gas-与链上拥堵)
 - [mint 费用](#mint-费用)
+- [PoD 深度挖矿](#pod-深度挖矿)
 - [Web 控制台](#web-控制台)
 - [执行语义](#执行语义)
 - [安全说明](#安全说明)
@@ -40,6 +41,7 @@
 | 自动对账 | `sent` 交易按 tx hash 对账链上回执，重跑不会重复广播，避免双花 |
 | 资金分发 | 从主钱包按分组 / ID 给账号补足或追加 OKB |
 | 定时调度 | `fabx auto` 到点自动定位最新或新增合约再批量 mint，支持提前抢跑 |
+| PoD 挖矿 | `fabx mine` 覆盖 tapeout / arm / start / claim / stop / reclaim 全链路（含防抢跑 commit 与本地向量预检） |
 | Web 控制台 | 账号、CPU、任务、资金四个页签，实时查看逐账号结果 |
 
 ## 快速开始
@@ -263,6 +265,73 @@ value = protocolFee + mintPrice × amount
 即每账号 2 笔协议费；想省钱就用 `--token-ids` 只买需要的那个，并把数量合并到一笔。
 随时可用 `fabx cpu state <地址>` 读出当前「单价」与「协议费」。
 
+## PoD 深度挖矿
+
+`fabx mine` 子命令覆盖「晶体管 → 电路 → 矿机 → 产币」的完整链路，全部逆向自
+`https://fabx.tech/assets/pod-*.js`：
+
+| 步骤 | 命令 | 说明 |
+| --- | --- | --- |
+| 全局状态 | `fabx mine status` | 是否已启动、当前速率、每日产出、任务数、矿池权重 |
+| 任务表 | `fabx mine tasks` | 列出官方 PoD 任务（含 nIn / nOut / cycles / 向量数） |
+| 预检 | `fabx mine preflight` | 官方 verify + 本地逐向量校验，**先验再流片**，避免白花费用 |
+| 流片 | `fabx mine tapeout` | 烧掉 NAND / LATCH 晶体管，铸出电路 ERC721（付固定 TAPEOUT_FEE） |
+| 上膛 | `fabx mine arm` | 取一个「锚点区块」，该区块哈希决定本次要提交哪些样本 |
+| 启动 | `fabx mine start` | 自动 arm（或复用 `--anchor`）→ 采样 → `start` 上链重放，矿机开始产出 |
+| 领取 | `fabx mine claim` | 多把 key 合并成一笔 `claimMany`，省 gas |
+| 停机 | `fabx mine stop` | 停止挖矿并进入冷却 |
+| 回收 | `fabx mine reclaim` | 冷却结束取回投入的晶体管 |
+| 本地清册 | `fabx mine list` | 列出 SQLite 里记录的电路（tapeout 产物）与其矿机 key |
+
+典型流程（RefBench，测试帐号 ID 4）：
+
+```bash
+# 1. 看全局状态与任务（挖矿未启动时 started=False，属正常）
+uv run fabx mine status
+uv run fabx mine tasks
+
+# 2. 预检设计（官方 verify + 本地逐向量）
+uv run fabx mine preflight --task 1 --gates '[["NAND",2,2]]'
+
+# 3. 流片成电路 NFT（--commit 可选：防抢跑；加 --dry-run 则只预估不广播）
+uv run fabx mine tapeout -a 4 --gates '[["NAND",2,2]]' --n-in 1 --n-out 1 --commit
+
+# 4. 启动挖矿：arm -> 采样 -> start（一步完成）
+uv run fabx mine start -a 4 --circuit-id <tapeout 返回的 circuitId> --task 1
+
+# 5. 查看 / 领取产出（key 从 start 输出或 fabx mine list 取）
+uv run fabx mine list -a 4
+uv run fabx mine claim -a 4 --keys 0x<key1>,0x<key2>
+
+# 6. 停机冷却后回收晶体管
+uv run fabx mine stop -a 4 --key 0x<key>
+uv run fabx mine reclaim -a 4 --key 0x<key>
+```
+
+**费用口径**（实测，以合约与回执为准）：
+
+- `TAPEOUT_FEE = 0.0013 OKB`，在 `tapeout` 时随交易支付；`--dry-run` 只预估并打印该项，**不广播**；
+- 另外还有 `commit`、`arm`、`start`、`claim`、`stop`、`reclaim` 的 gas；
+  `start` 需要上链重放样本，gas 最高（默认上限 `FABX_MINE_START_GAS_LIMIT=1500000`）；
+- 所有写操作都走 [动态 gas](#动态-gas-与链上拥堵)：每次广播前重新取价，
+  超过 `FABX_GAS_PRICE_MAX_GWEI` 时**跳过而不是硬加价**，拥堵时不会盲付高价。
+
+**防抢跑（salt / commit）**：`tapeout --commit` 会先发一笔 `commitDesign`，把
+`keccak(abi.encode(account, circuits, netlistHash, salt))` 记在链上，再等一个区块后 tapeout。
+salt 现场随机生成并写入 SQLite，`start` 时用 `_resolve_salt` 按
+「入参 `--salt` > 本地记录 > `FABX_MINE_SALT` > 全零」的顺序取回，保证
+`commit` 与 `start` 用的是同一个 salt。本地 ABI 编码已与链上 `designCommitment` 视图逐字节对齐。
+
+**并发与提速**：`FABX_CONCURRENCY`（默认 5）控制同任务内并行账号数；
+`FABX_PIPELINE_TXS`（默认 4）控制同一账号内「连续广播、稍后统一等回执」的条数，
+nonce 严格递增所以不会撞车，只是把多笔等待时间重叠起来。
+
+> **当前状态**：合约 `startTime = 2^64-1`、`currentRate = 0`、`minerCount = 0`，即
+> 官方**尚未开启**挖矿。`tapeout` / `arm` 可正常执行，但 `start` 需要等正式开启
+> （任务数 100 已就绪）。开启后 `fabx mine status` 的 `started` 会变为 `True`。
+> RefBench / FAB-Genesis 晶体管目前**已售罄**，没有晶体管就无法 tapeout——先确保
+> `fabx mine list` / 晶体管余额里有足够的 NAND / LATCH。
+
 ## Web 控制台
 
 ```bash
@@ -393,8 +462,9 @@ uv run fabx cpu state 0x158341E42F00f658C86e3d42bC4c397Df16795DA
   mint 本身不直接产出 `$FAB`，没有“每天能 mint 一次”这种机制。
 - **mint 晶体管就等于挖矿吗？** 不等于。官网「如何挖矿」是 5 步：选题目 → 备晶体管
   （mint / 交易得到 NAND、LATCH）→ 设计电路（画布）→ 流片 Tape out（燃烧晶体管、
-  链上铸造电路、永久归属）→ 启动矿机。本工具目前只覆盖其中的备料环节（mint 晶体管），
-  真正产出 `$FAB` 需要后续设计、流片、启动矿机。
+  链上铸造电路、永久归属）→ 启动矿机。本工具既覆盖备料环节（`fabx job` / `fabx cpu`
+  批量 mint 晶体管），也覆盖后续链路（`fabx mine` 的 tapeout / arm / start / claim /
+  stop / reclaim），详见 [PoD 深度挖矿](#pod-深度挖矿)。
 - **任务全部 `skipped`？** 常见原因是合约已售罄，或账号 OKB 不足以覆盖
   `协议费 + 单价×数量 + gas`。用 `fabx cpu state <地址>` 与 `fabx account list --balance` 排查。
 - **报 value 不足 / 交易 revert？** 多半是漏算协议费。本工具已把 `protocolFee` 计入
@@ -411,7 +481,9 @@ uv run pytest
 ```
 
 覆盖私钥加解密与错误口令、ABI 完整性、SQLite 账号 / 任务状态机、Web 账号生命周期与任务编排、
-定时调度的时间解析与抢跑探测、协议费计入花费（链上调用以替身拦截，测试不访问网络）。
+定时调度的时间解析与抢跑探测、协议费计入花费、网表编解码与本地逐向量评估、
+PoD 设计承诺（`designCommitment` 与链上视图逐字节一致）与挖矿交易编排
+（链上调用以替身拦截，测试不访问网络）。
 
 ## 项目结构
 
@@ -419,8 +491,10 @@ uv run pytest
 fabx-minter/
 ├── src/fabx_minter/
 │   ├── abi/fabx.abi.json   # 逆向提取的 13 套 ABI
-│   ├── chain.py            # 链上读写：状态、价格、协议费
+│   ├── chain.py            # 链上读写：状态、价格、协议费、挖矿只读与动态 gas
 │   ├── minter.py           # 批量 mint 引擎（规划 / 广播 / 对账）
+│   ├── mining.py           # PoD 挖矿引擎（tapeout / arm / start / claim / stop / reclaim）
+│   ├── netlist.py          # 网表编解码、本地逐向量评估与 burn 预估
 │   ├── scheduler.py        # 定时调度与自动定位合约
 │   ├── funding.py          # 主钱包资金分发
 │   ├── crypto.py / accounts.py / db.py / models.py / config.py

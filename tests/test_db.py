@@ -230,6 +230,66 @@ def test_job_counts_skipped_as_finished(db: Database) -> None:
     assert job.progress == 1.0
 
 
+def test_circuit_upsert_and_miner_backfill(db: Database) -> None:
+    """tapeout 落库要能写完整记录，start 后回填 task_id / miner_key。"""
+    from fabx_minter.models import CircuitIn
+
+    account_id = db.add_account(ADDR_A, _cipher(), label=None, group=None)
+    circuits = "0x" + "11" * 20
+    circuit_id = db.add_circuit(
+        CircuitIn(
+            account_id=account_id,
+            circuits=circuits,
+            circuit_id=7,
+            n_in=1,
+            n_out=1,
+            n_state=0,
+            gate_count=1,
+            salt="0" * 64,
+            tx_hash="0x" + "aa" * 32,
+            block_number=123,
+        )
+    )
+    assert circuit_id > 0
+    record = db.get_circuit(circuits, 7)
+    assert record is not None
+    assert record.account_id == account_id
+    assert record.salt == "0" * 64
+    assert record.task_id is None
+
+    # 同一 (circuits, circuitId) 重复写入只更新可重算字段，不能抹掉已用于 start 的 salt
+    same_id = db.add_circuit(
+        CircuitIn(
+            account_id=account_id,
+            circuits=circuits.upper(),
+            circuit_id=7,
+            n_in=2,
+            n_out=2,
+            n_state=1,
+            gate_count=3,
+            salt=None,
+        )
+    )
+    assert same_id == circuit_id
+    assert len(db.list_circuits(circuits=circuits)) == 1
+    record = db.get_circuit(circuits, 7)
+    assert record is not None
+    assert record.n_in == 2
+    assert record.salt == "0" * 64
+
+    db.set_circuit_miner(
+        circuits=circuits,
+        circuit_id=7,
+        task_id=1,
+        miner_key="0x" + "22" * 32,
+    )
+    record = db.get_circuit(circuits, 7)
+    assert record is not None
+    assert record.task_id == 1
+    assert record.miner_key == "0x" + "22" * 32
+    assert [c.circuit_id for c in db.list_circuits(account_id=account_id)] == [7]
+
+
 def test_cpu_upsert_and_listing(db: Database) -> None:
     from fabx_minter.models import CpuOut
 
