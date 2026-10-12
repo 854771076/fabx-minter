@@ -58,6 +58,16 @@ class Settings(BaseSettings):
     gas_limit: int = 0  # 0 表示链上估算
     gas_price_gwei: float = 0.0  # 0 表示取链上 gasPrice
     gas_multiplier: float = 1.15
+    # 动态 gas 上限：链上拥堵时 gasPrice 会抬升，这里设一个硬上限。
+    # 计算出的价格超过上限时不再盲目加价，而是跳过该笔并提示，避免在拥堵中付出离谱手续费。
+    # 0 表示不设上限。
+    gas_price_max_gwei: float = 0.0
+    # 交易广播后若在 pending_timeout 秒内仍未打包，视为「卡住」：
+    # 按 gas_bump_percent 加价、用同一 nonce 重发替换交易来解拥堵。
+    # pending_timeout<=0 或 gas_bump_max_attempts<=0 表示关闭加价替换，退回只等 tx_timeout。
+    pending_timeout: int = 45
+    gas_bump_percent: float = 20.0
+    gas_bump_max_attempts: int = 2
     tx_timeout: int = 180
     max_retries: int = 2
     rpc_timeout: float = 30.0
@@ -81,6 +91,34 @@ class Settings(BaseSettings):
     def _sane_multiplier(cls, v: float) -> float:
         if v < 1.0:
             raise ValueError("FABX_GAS_MULTIPLIER 必须 >= 1.0")
+        return v
+
+    @field_validator("gas_price_max_gwei")
+    @classmethod
+    def _non_negative_cap(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("FABX_GAS_PRICE_MAX_GWEI 不能为负数")
+        return v
+
+    @field_validator("pending_timeout")
+    @classmethod
+    def _non_negative_pending(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("FABX_PENDING_TIMEOUT 不能为负数")
+        return v
+
+    @field_validator("gas_bump_percent")
+    @classmethod
+    def _non_negative_bump(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("FABX_GAS_BUMP_PERCENT 不能为负数")
+        return v
+
+    @field_validator("gas_bump_max_attempts")
+    @classmethod
+    def _non_negative_bump_attempts(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("FABX_GAS_BUMP_MAX_ATTEMPTS 不能为负数")
         return v
 
     def resolved_db_path(self) -> Path:

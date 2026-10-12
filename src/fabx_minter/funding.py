@@ -13,7 +13,7 @@ from typing import Any
 
 from web3 import Web3
 
-from .chain import make_web3
+from .chain import dynamic_gas_price, gas_price_cap_wei, make_web3
 from .config import Settings
 from .db import Database
 from .models import FundRequest, FundResult, FundResultItem
@@ -22,12 +22,8 @@ log = logging.getLogger("fabx.funding")
 
 
 def _gas_price(w3: Web3, settings: Settings) -> int:
-    base = (
-        Web3.to_wei(settings.gas_price_gwei, "gwei")
-        if settings.gas_price_gwei > 0
-        else int(w3.eth.gas_price)
-    )
-    return int(base * settings.gas_multiplier)
+    # 复用链层的动态取价逻辑：固定值 / 链上实时 gasPrice，再乘拥堵缓冲系数
+    return dynamic_gas_price(w3, settings)
 
 
 def _transfer_gas_limit(
@@ -73,12 +69,11 @@ def distribute_funds(
     if not accounts:
         raise ValueError("没有可用的目标账号")
 
-    gas_price = _gas_price(w3, settings)
-
     nonce = int(w3.eth.get_transaction_count(master_address, "pending"))
     master_balance = int(w3.eth.get_balance(master_address))
     result.notes.append(
-        f"主钱包 {master_address} 余额 {master_balance} wei，gas 单价 {gas_price} wei"
+        f"主钱包 {master_address} 余额 {master_balance} wei，"
+        f"gas 单价将在每笔广播前按链上实时价格读取"
     )
 
     for account in accounts:
@@ -112,6 +107,45 @@ def distribute_funds(
                     status="dry-run",
                 )
             )
+            continue
+
+        # 每笔广播前重新取价：链上拥堵会让 gasPrice 持续抬升，整批只读一次
+        # 会让后半程的转账以过低价格广播，长时间 pending。
+        try:
+            gas_price = _gas_price(w3, settings)
+        except Exception as exc:
+            reason = f"读取链上 gas 价失败（RPC 抖动）: {exc}"
+            result.failed += 1
+            result.items.append(
+                FundResultItem(
+                    account_id=account.id,
+                    address=target,
+                    amount_wei=amount,
+                    status="failed",
+                    error=reason,
+                )
+            )
+            db.log_event(f"资金分发读取 gas 价失败 {target}: {reason}", level="error")
+            continue
+
+        # 拥堵时 gas 价可能飙升，超过用户设定的硬上限就不广播，避免手续费失控
+        cap = gas_price_cap_wei(settings)
+        if cap and gas_price > cap:
+            reason = (
+                f"gas 价 {gas_price} wei 超过上限 {cap} wei（链上拥堵），本笔未广播；"
+                f"如需继续可调高 FABX_GAS_PRICE_MAX_GWEI"
+            )
+            result.failed += 1
+            result.items.append(
+                FundResultItem(
+                    account_id=account.id,
+                    address=target,
+                    amount_wei=amount,
+                    status="failed",
+                    error=reason,
+                )
+            )
+            db.log_event(f"资金分发跳过（gas 超上限）{target}: {reason}", level="warn")
             continue
 
         # 每笔转账按实际目标金额估算 gas，比固定 21,000 更贴近真实消耗

@@ -209,6 +209,29 @@ def native_balance(w3: Web3, address: str) -> int:
     return int(w3.eth.get_balance(Web3.to_checksum_address(address)))
 
 
+def dynamic_gas_price(w3: Web3, settings: Settings) -> int:
+    """计算当前应付的 gas 单价（wei）。
+
+    - ``FABX_GAS_PRICE_GWEI > 0`` 时用固定值，否则读链上实时 ``gasPrice``；
+    - 乘 ``FABX_GAS_MULTIPLIER`` 作为拥堵缓冲，提高被打包进下一区块的概率。
+
+    关键是「每次广播前都重新读一次」：链上拥堵会让 ``gasPrice`` 持续抬升，
+    若只在一批任务开始时读一次，后续交易很容易因定价过低而长时间 pending。
+    """
+    if settings.gas_price_gwei > 0:
+        base = Web3.to_wei(settings.gas_price_gwei, "gwei")
+    else:
+        base = int(w3.eth.gas_price)
+    return int(base * settings.gas_multiplier)
+
+
+def gas_price_cap_wei(settings: Settings) -> int:
+    """``FABX_GAS_PRICE_MAX_GWEI`` 换算成 wei；0 表示不设上限。"""
+    if settings.gas_price_max_gwei <= 0:
+        return 0
+    return int(Web3.to_wei(settings.gas_price_max_gwei, "gwei"))
+
+
 def format_okb(wei: int) -> str:
     """按 18 位小数格式化，去掉无意义尾零。"""
     whole, frac = divmod(wei, 10**18)

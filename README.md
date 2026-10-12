@@ -19,6 +19,7 @@
 - [准备账号与资金](#准备账号与资金)
 - [命令行用法](#命令行用法)
 - [定时调度（到点自动 mint）](#定时调度到点自动-mint)
+- [动态 gas 与链上拥堵](#动态-gas-与链上拥堵)
 - [mint 费用](#mint-费用)
 - [Web 控制台](#web-控制台)
 - [执行语义](#执行语义)
@@ -96,6 +97,10 @@ Python 版本由 `.python-version` 固定为 3.12（web3 尚不支持 3.13+）�
 | `FABX_CONCURRENCY` | `5` | 并行处理的**账号数**，必须 ≥ 1 |
 | `FABX_GAS_MULTIPLIER` | `1.15` | gas 价格上浮系数，必须 ≥ 1.0 |
 | `FABX_GAS_PRICE_GWEI` | `0` | 固定 gas 价；0 表示取链上 `gasPrice` |
+| `FABX_GAS_PRICE_MAX_GWEI` | `0` | 动态 gas 硬上限；拥堵时价格超过它就跳过该笔，0 表示不设上限 |
+| `FABX_PENDING_TIMEOUT` | `45` | 广播后超过该秒数仍未打包就触发加价替换；0 表示关闭 |
+| `FABX_GAS_BUMP_PERCENT` | `20` | 加价替换时每次提价的百分比 |
+| `FABX_GAS_BUMP_MAX_ATTEMPTS` | `2` | 单笔最多加价替换几次；0 表示关闭 |
 | `FABX_GAS_LIMIT` | `0` | 固定 gas 上限；0 表示链上估算 |
 | `FABX_TX_TIMEOUT` | `180` | 等待回执超时（秒） |
 | `FABX_MAX_RETRIES` | `2` | 单笔广播重试次数 |
@@ -198,6 +203,37 @@ uv run fabx auto --at 22:00 --target new --lead-seconds 5 --amount 1 --group bat
 到点只是「建任务 + 执行」，真正的签名广播仍走与手动模式完全相同的引擎：余额预检、
 售罄跳过、nonce 串行、链上对账、`FABX_CONCURRENCY` 并发账号。若到点时没有可铸额度
 （例如仍是已售罄的旧合约），任务会全部落到 `skipped` 而不是报错。
+
+## 动态 gas 与链上拥堵
+
+开场抢跑时链上常常突然拥堵，`gasPrice` 会实时波动，因此本工具在 gas 上做了三层处理：
+
+1. **每笔广播前重新取价**：`FABX_GAS_PRICE_GWEI=0` 时读链上实时 `gasPrice`，
+   再乘 `FABX_GAS_MULTIPLIER`。任务里每一笔交易发送前都重读一次，拥堵抬价时能跟上，
+   不会整批沿用开头那个过低的价格。
+2. **硬上限护栏**：`FABX_GAS_PRICE_MAX_GWEI` 设一个能接受的最高价（gwei）。拥堵时
+   实时价一旦超过它，该笔直接跳过并记为 `skipped`，而不是默默用高价广播；
+   想继续就调高上限后 `fabx job reset` + `fabx job run`（`reset` 会把 `skipped` 复位）。
+3. **卡住就加价替换**：交易广播后若 `FABX_PENDING_TIMEOUT` 秒内仍未打包，工具会用
+   **同一 nonce、同一金额**、按 `FABX_GAS_BUMP_PERCENT` 加价后重新签名广播，最多替换
+   `FABX_GAS_BUMP_MAX_ATTEMPTS` 次。同一 nonce 最终只有一笔会上链，所以不会重复扣款；
+   替换成功后数据库记录的是最新那笔的 hash，重跑对账也以它为准。
+
+资金分发（给账号发 OKB）走同样的逻辑：每笔转账前重读一次 gas 价，并受同一个上限约束。
+
+参考当前链上 `gasPrice` 约 `0.021 gwei`，一个偏保守的上限示例：
+
+```bash
+# 拥堵时最多接受到 0.1 gwei（约为平时的 5 倍），超过就跳过不广播
+FABX_GAS_PRICE_MAX_GWEI=0.1 uv run fabx job run 1
+
+# 抢跑想更快：加大上浮与加价幅度（更快，但更贵）
+FABX_GAS_MULTIPLIER=1.5 FABX_GAS_BUMP_PERCENT=30 \
+  uv run fabx auto --at 10:00 --target new --lead-seconds 5 --amount 1 --group batch-01
+```
+
+> 极端拥堵下即使加价也可能长时间不打包。此时交易保持 `sent`，重跑只做 `tx_hash`
+> 对账、不会重复广播；确认链上已失败或被丢弃后，再 `fabx job reset` 重发。
 
 ## mint 费用
 

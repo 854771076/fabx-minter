@@ -8,6 +8,7 @@ import pytest
 
 from fabx_minter import chain
 from fabx_minter.chain import TransistorState, format_okb
+from fabx_minter.config import Settings
 
 
 def _state(**overrides) -> TransistorState:
@@ -180,3 +181,26 @@ def test_read_state_skips_views_absent_from_abi(monkeypatch) -> None:
     assert state.minted_by_id == {}
     assert state.type_cap == {}
     assert state.cpu_name is None
+
+
+def test_dynamic_gas_price_uses_live_price_with_multiplier() -> None:
+    """gas_price_gwei=0 时读取链上实时 gasPrice，并叠加拥堵缓冲系数。"""
+    settings = Settings(gas_price_gwei=0, gas_multiplier=2.0)
+    w3 = SimpleNamespace(eth=SimpleNamespace(gas_price=10**9))
+    assert chain.dynamic_gas_price(w3, settings) == 2 * 10**9
+
+
+def test_dynamic_gas_price_uses_fixed_price_when_set() -> None:
+    """设置了固定 gas 价时不再读链上 gasPrice（传 object() 也不应触发 RPC）。"""
+    settings = Settings(gas_price_gwei=0.1, gas_multiplier=1.0)
+    assert chain.dynamic_gas_price(object(), settings) == 10**8
+
+
+def test_gas_price_cap_zero_means_no_cap() -> None:
+    """gas_price_max_gwei=0 表示不设硬上限。"""
+    assert chain.gas_price_cap_wei(Settings(gas_price_max_gwei=0)) == 0
+
+
+def test_gas_price_cap_converts_gwei_to_wei() -> None:
+    """硬上限按 gwei 换算为 wei，供执行层比较是否超限。"""
+    assert chain.gas_price_cap_wei(Settings(gas_price_max_gwei=5)) == 5 * 10**9

@@ -228,6 +228,126 @@ def test_run_job_skips_zero_balance_before_estimate(
     assert "余额不足" in (kept.error or "")
 
 
+def test_run_job_skips_when_gas_price_over_cap(
+    db: Database, settings: Settings, monkeypatch
+) -> None:
+    """链上拥堵把 gas 价推到上限之上时，应跳过该笔而不是以高价默默广播。"""
+    job_id, task = _seed_job(db)
+    monkeypatch.setattr(
+        "fabx_minter.minter.read_transistor_state", lambda w3, addr: _mintable_state()
+    )
+    eth = _FakeEth()  # gas_price = 1e9 wei（1 gwei），乘默认 1.15 后约 1.15 gwei
+    monkeypatch.setattr("fabx_minter.minter.make_web3", lambda settings: _fake_web3(eth))
+    capped = settings.model_copy(update={"gas_price_max_gwei": 0.5})  # 上限 0.5 gwei
+
+    def _no_estimate(self, w3, t, addr):
+        raise AssertionError("gas 价超上限时不应再进入 estimate_gas")
+
+    monkeypatch.setattr(MintEngine, "_estimate_gas", _no_estimate)
+
+    report = MintEngine(db, capped, password="pw").run_job(job_id)
+
+    assert report.skipped == 1
+    assert report.failed == 0
+    assert eth.broadcast == []
+    kept = db.get_task(task.id)
+    assert kept is not None
+    assert kept.status == TaskStatus.SKIPPED
+    assert "上限" in (kept.error or "")
+
+
+def test_run_job_bumps_gas_when_transaction_stuck(
+    db: Database, settings: Settings, monkeypatch
+) -> None:
+    """交易长时间未打包时，应用同一 nonce 加价替换重发，并以最新 hash 收尾。"""
+    job_id, task = _seed_job(db)
+    monkeypatch.setattr(
+        "fabx_minter.minter.read_transistor_state", lambda w3, addr: _mintable_state()
+    )
+    eth = _FakeEth()
+    monkeypatch.setattr("fabx_minter.minter.make_web3", lambda settings: _fake_web3(eth))
+    monkeypatch.setattr(MintEngine, "_estimate_gas", lambda self, w3, t, addr: 50_000)
+
+    hashes = ["0x" + "aa" * 32, "0x" + "bb" * 32]
+    sent: list[tuple[str, int]] = []
+
+    def _fake_send(self, w3, pk, address, t, nonce, gas_price, gas_limit):
+        tx_hash = hashes[len(sent)]
+        sent.append((tx_hash, gas_price))
+        return tx_hash, nonce
+
+    monkeypatch.setattr(MintEngine, "_send_mint", _fake_send)
+
+    waits: list[str] = []
+
+    def _wait(tx_hash, timeout: int = 0):
+        waits.append(tx_hash)
+        if tx_hash == hashes[1]:
+            return {"status": 1, "blockNumber": 9, "gasUsed": 50_000}
+        # 第一笔一直查不到回执，模拟拥堵导致长时间 pending
+        raise Exception("TransactionNotFound")
+
+    eth.wait_for_transaction_receipt = _wait
+
+    tuned = settings.model_copy(
+        update={
+            "gas_price_gwei": 1.0,  # 固定基准价，让断言可预测
+            "pending_timeout": 1,
+            "gas_bump_percent": 25.0,
+            "gas_bump_max_attempts": 2,
+        }
+    )
+
+    report = MintEngine(db, tuned, password="pw").run_job(job_id)
+
+    assert report.confirmed == 1
+    assert len(sent) == 2  # 原始一笔 + 加价替换一笔
+    assert sent[1][1] > sent[0][1]  # 替换价必须更高
+    assert waits == [hashes[0], hashes[1]]  # 先等原交易，再等替换交易
+    confirmed = db.get_task(task.id)
+    assert confirmed is not None
+    assert confirmed.status == TaskStatus.CONFIRMED
+    assert confirmed.tx_hash == hashes[1]  # 记录最新那笔的 hash
+
+
+def test_run_job_without_bump_keeps_sent_on_timeout(
+    db: Database, settings: Settings, monkeypatch
+) -> None:
+    """关闭加价替换时应保持旧语义：超时只保留 SENT 供对账，不额外广播。"""
+    job_id, task = _seed_job(db)
+    monkeypatch.setattr(
+        "fabx_minter.minter.read_transistor_state", lambda w3, addr: _mintable_state()
+    )
+    eth = _FakeEth()
+    monkeypatch.setattr("fabx_minter.minter.make_web3", lambda settings: _fake_web3(eth))
+    monkeypatch.setattr(MintEngine, "_estimate_gas", lambda self, w3, t, addr: 50_000)
+
+    sent: list[str] = []
+
+    def _fake_send(self, w3, pk, address, t, nonce, gas_price, gas_limit):
+        sent.append("0x" + "cc" * 32)
+        return sent[-1], nonce
+
+    monkeypatch.setattr(MintEngine, "_send_mint", _fake_send)
+
+    def _wait(tx_hash, timeout: int = 0):
+        raise Exception("timeout")
+
+    eth.wait_for_transaction_receipt = _wait
+
+    tuned = settings.model_copy(
+        update={"gas_bump_max_attempts": 0, "tx_timeout": 1}
+    )
+
+    report = MintEngine(db, tuned, password="pw").run_job(job_id)
+
+    assert report.skipped == 1
+    assert len(sent) == 1  # 未开启替换就不会二次广播
+    kept = db.get_task(task.id)
+    assert kept is not None
+    assert kept.status == TaskStatus.SENT
+
+
 def _seed_two_accounts(db: Database) -> None:
     """导入两个启用账号，用于验证跨账号共享额度的规划逻辑。"""
     db.add_account(ADDRESS, encrypt_private_key(PRIVATE_KEY, "pw"), label=None, group=None)

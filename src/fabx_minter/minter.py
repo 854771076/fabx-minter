@@ -18,6 +18,8 @@ from web3 import Web3
 
 from .chain import (
     ChainReadError,
+    dynamic_gas_price,
+    gas_price_cap_wei,
     make_web3,
     read_transistor_state,
     transistors_contract,
@@ -349,7 +351,6 @@ class MintEngine:
         confirmed = failed = skipped = 0
         notes: list[str] = []
         nonce = int(w3.eth.get_transaction_count(address, "pending"))
-        gas_price = self._gas_price(w3)
 
         for task in tasks:
             # 已广播但未确认的交易：只做链上对账，绝不重复广播，避免重复扣款。
@@ -366,6 +367,30 @@ class MintEngine:
                 notes.append(
                     f"{address} 完成 {confirmed + failed + skipped}/{len(tasks)}"
                 )
+                continue
+
+            # 每笔发送前重新取一次 gas 价：链上拥堵会让 gasPrice 持续抬升，
+            # 若整批只读一次，后半程可能以过低价格广播，交易迟迟不打包。
+            try:
+                gas_price = self._gas_price(w3)
+            except Exception as exc:
+                reason = f"读取链上 gas 价失败（RPC 抖动）: {exc}"
+                db.mark_task_failed(task.id, reason, status=TaskStatus.SKIPPED)
+                db.log_event(reason, level="warn", job_id=task.job_id, task_id=task.id)
+                skipped += 1
+                continue
+
+            # 拥堵时 gas 价可能飙升，超过用户设定的硬上限就跳过本笔，
+            # 而不是默默以高价广播，把手续费失控留在事后才发现。
+            cap = gas_price_cap_wei(settings)
+            if cap and gas_price > cap:
+                reason = (
+                    f"gas 价 {gas_price} wei 超过上限 {cap} wei（链上拥堵），"
+                    f"本笔跳过；如需继续可调高 FABX_GAS_PRICE_MAX_GWEI"
+                )
+                db.mark_task_failed(task.id, reason, status=TaskStatus.SKIPPED)
+                db.log_event(reason, level="warn", job_id=task.job_id, task_id=task.id)
+                skipped += 1
                 continue
 
             # 余额预检：节点在 estimate_gas 阶段就会因「gas*price+value 超过余额」
@@ -444,14 +469,16 @@ class MintEngine:
 
             db.mark_task_sent(task.id, nonce=used_nonce, tx_hash=tx_hash)
             nonce = used_nonce + 1
-            try:
-                receipt = w3.eth.wait_for_transaction_receipt(
-                    tx_hash, timeout=settings.tx_timeout
-                )
-            except Exception as exc:
+            receipt, tx_hash, gas_price, wait_error = self._wait_receipt_with_bumps(
+                w3, private_key, address, task, used_nonce, tx_hash, gas_price, gas_limit
+            )
+            if receipt is None:
                 # 超时不等于失败：交易可能仍在链上 pending。保留 SENT 状态并记录提示，
                 # 下次重跑会按 tx_hash 对账，不会重复广播。
-                message = f"等待回执超时，交易可能仍在链上，可重跑对账: {exc}"
+                message = (
+                    "等待回执超时，交易可能仍在链上，可重跑对账；"
+                    f"拥堵时可调高 FABX_GAS_BUMP_PERCENT / FABX_GAS_BUMP_MAX_ATTEMPTS: {wait_error}"
+                )
                 db.mark_task_unconfirmed(task.id, message)
                 db.log_event(message, level="warn", job_id=task.job_id, task_id=task.id)
                 skipped += 1
@@ -531,11 +558,96 @@ class MintEngine:
         return int(estimate * _GAS_LIMIT_BUFFER)
 
     def _gas_price(self, w3: Web3) -> int:
-        if self.settings.gas_price_gwei > 0:
-            base = Web3.to_wei(self.settings.gas_price_gwei, "gwei")
-        else:
-            base = int(w3.eth.gas_price)
-        return int(base * self.settings.gas_multiplier)
+        # 每次调用都重新读取链上价格，让定价跟随拥堵动态变化，而不是一次读值用到底。
+        return dynamic_gas_price(w3, self.settings)
+
+    def _wait_receipt_with_bumps(
+        self,
+        w3: Web3,
+        private_key: str,
+        address: str,
+        task: Any,
+        nonce: int,
+        tx_hash: str,
+        gas_price: int,
+        gas_limit: int,
+    ) -> tuple[dict[str, Any] | None, str, int, str | None]:
+        """等待回执；交易长时间未打包时按设定加价、用同一 nonce 替换重发以解拥堵。
+
+        返回 ``(回执或 None, 最新 tx_hash, 最新 gas_price, 最后一次异常文本)``。
+        替换交易只提高 ``gasPrice``，其余字段（含 ``value``）保持一致，同一 nonce
+        最终只有一笔会打包，因此不会重复扣款；替换成功后 DB 记录的是最新那笔的 hash。
+        """
+        settings = self.settings
+        db = self.db
+        attempts = settings.gas_bump_max_attempts
+        percent = settings.gas_bump_percent
+        pending_timeout = settings.pending_timeout
+        bump_enabled = attempts > 0 and percent > 0 and pending_timeout > 0
+
+        current_hash = tx_hash
+        current_price = gas_price
+        last_error: str | None = None
+
+        if not bump_enabled:
+            # 未开启加价替换时保持原有语义：用完整 tx_timeout 等一次回执。
+            try:
+                receipt = w3.eth.wait_for_transaction_receipt(
+                    current_hash, timeout=settings.tx_timeout
+                )
+                return receipt, current_hash, current_price, None
+            except Exception as exc:
+                return None, current_hash, current_price, str(exc)
+
+        for bump_index in range(attempts + 1):
+            try:
+                receipt = w3.eth.wait_for_transaction_receipt(
+                    current_hash, timeout=pending_timeout
+                )
+                return receipt, current_hash, current_price, None
+            except Exception as exc:
+                last_error = str(exc)
+
+            if bump_index >= attempts:
+                break
+
+            cap = gas_price_cap_wei(settings)
+            if cap and current_price >= cap:
+                # 已顶到用户允许的上限，再提价就超出范围，保持原价继续等待
+                break
+            new_price = int(current_price * (1 + percent / 100))
+            if cap:
+                new_price = min(new_price, cap)
+            try:
+                new_hash, _used_nonce = self._send_mint(
+                    w3, private_key, address, task, nonce, new_price, gas_limit
+                )
+            except Exception as exc:
+                # 替换失败不致命（如原交易已被打包、节点拒绝提交）：保留原 hash 继续等
+                log.warning(
+                    "gas 加价替换失败（nonce=%s, %s wei）: %s", nonce, new_price, exc
+                )
+                last_error = str(exc)
+                continue
+            current_hash = new_hash
+            current_price = new_price
+            db.mark_task_sent(task.id, nonce=nonce, tx_hash=new_hash)
+            db.log_event(
+                f"gas 加价替换：nonce={nonce} 提价至 {new_price} wei"
+                f"（第 {bump_index + 1} 次，链上拥堵）",
+                level="warn",
+                job_id=task.job_id,
+                task_id=task.id,
+            )
+
+        # 用尽加价次数仍未打包：再给足一次完整 tx_timeout，避免把可能即将上链的交易判成未知
+        try:
+            receipt = w3.eth.wait_for_transaction_receipt(
+                current_hash, timeout=settings.tx_timeout
+            )
+            return receipt, current_hash, current_price, None
+        except Exception as exc:
+            return None, current_hash, current_price, str(exc)
 
     def _send_mint(
         self,
